@@ -22,7 +22,7 @@ template <> void put<int8_t>(Preferences &p, const char *key, int8_t value) { p.
  X(autoMeasurementDelayMs, UShort, uint16_t) X(automaticModeEnabled, Bool, bool) \
  X(maxMeasurementTravelMm, Float, float) X(maxCalibrationTravelMm, Float, float) \
  X(maxMeasurementTimeMs, UInt, uint32_t) X(maxCalibrationTimeMs, UInt, uint32_t) X(maxContinuousManualLeftTimeMs, UInt, uint32_t) \
- X(deviationGreenPercent, Float, float) X(deviationRedPercent, Float, float) X(wifiConnectTimeoutMs, UInt, uint32_t) X(wifiRetryIntervalMs, UInt, uint32_t)
+ X(deviationGreenPercent, Float, float) X(deviationRedPercent, Float, float)
 
 void jsonField(JsonObject out, const char *name, const String &value) { out[name] = value; }
 template <typename T> void jsonField(JsonObject out, const char *name, T value) { out[name] = value; }
@@ -46,10 +46,8 @@ bool ConfigManager::loadConfig() {
 #define LOAD(name, type, cpp) config_.name = p.get##type(#name, config_.name);
   CFG_NUMBERS(LOAD)
 #undef LOAD
-  config_.wifiSsid = p.getString("wifiSsid", config_.wifiSsid);
-  config_.wifiPassword = p.getString("wifiPassword", config_.wifiPassword);
-  config_.fallbackApSsid = p.getString("fallbackApSsid", config_.fallbackApSsid);
-  config_.fallbackApPassword = p.getString("fallbackApPassword", config_.fallbackApPassword);
+  config_.apSsidPrefix = p.getString("apSsidPrefix", config_.apSsidPrefix);
+  config_.apPassword = p.getString("apPassword", config_.apPassword);
   p.end();
   String error;
   if (!validateConfig(config_, error)) { Serial.printf("[CONFIG] Invalid NVS config: %s; defaults restored\n", error.c_str()); resetConfigToDefaults(); return saveConfig(); }
@@ -63,8 +61,7 @@ bool ConfigManager::saveConfig() {
 #define SAVE(name, type, cpp) put<cpp>(p, #name, config_.name);
   CFG_NUMBERS(SAVE)
 #undef SAVE
-  p.putString("wifiSsid", config_.wifiSsid); p.putString("wifiPassword", config_.wifiPassword);
-  p.putString("fallbackApSsid", config_.fallbackApSsid); p.putString("fallbackApPassword", config_.fallbackApPassword);
+  p.putString("apSsidPrefix", config_.apSsidPrefix); p.putString("apPassword", config_.apPassword);
   p.putBool("saved", true); p.end(); Serial.println("[CONFIG] Saved to NVS"); return true;
 }
 
@@ -76,7 +73,7 @@ bool ConfigManager::validateConfig(const DeviceConfig &c, String &error) const {
   if (c.calibrationLengthMm <= 0 || c.manualLeftSpeedMmS < 0 || c.measurementSpeedMmS <= 0 || c.fineMeasurementSpeedMmS <= 0 || c.calibrationSpeedMmS <= 0 || c.fineCalibrationSpeedMmS <= 0 || c.accelerationMmSS < 0) { error = "Некорректная длина или скорость"; return false; }
   if (c.contactBackoffMm < 0 || c.maxMeasurementTravelMm <= 0 || c.maxCalibrationTravelMm <= 0 || c.maxMeasurementTimeMs == 0 || c.maxCalibrationTimeMs == 0 || c.maxContinuousManualLeftTimeMs == 0) { error = "Некорректные пределы движения"; return false; }
   if (c.deviationGreenPercent < 0 || c.deviationRedPercent < c.deviationGreenPercent) { error = "Зелёный порог не может быть больше красного"; return false; }
-  if (c.fallbackApSsid.length() == 0 || c.fallbackApPassword.length() < 8) { error = "SSID AP пуст или пароль AP короче 8 символов"; return false; }
+  if (c.apSsidPrefix.length() == 0 || c.apPassword.length() < 8) { error = "Префикс SSID пуст или пароль AP короче 8 символов"; return false; }
   return true;
 }
 
@@ -85,8 +82,8 @@ void ConfigManager::toJson(JsonObject out, bool includePassword) const {
   CFG_NUMBERS(JSON)
 #undef JSON
   out["stepsPerMm"] = ::stepsPerMm(config_);
-  out["wifiSsid"] = config_.wifiSsid; out["fallbackApSsid"] = config_.fallbackApSsid;
-  if (includePassword) { out["wifiPassword"] = config_.wifiPassword; out["fallbackApPassword"] = config_.fallbackApPassword; }
+  out["apSsidPrefix"] = config_.apSsidPrefix;
+  if (includePassword) out["apPassword"] = config_.apPassword;
 }
 
 bool ConfigManager::updateFromJson(JsonObjectConst in, String &error, bool &mechanicsChanged, bool &wifiChanged) {
@@ -95,10 +92,9 @@ bool ConfigManager::updateFromJson(JsonObjectConst in, String &error, bool &mech
 #define UPDATE(name, type, cpp) updateNumber<cpp>(in, #name, next.name);
   CFG_NUMBERS(UPDATE)
 #undef UPDATE
-  updateString(in, "214lab", next.wifiSsid); updateString(in, "@dsorber!", next.wifiPassword);
-  updateString(in, "fallbackApSsid", next.fallbackApSsid); updateString(in, "fallbackApPassword", next.fallbackApPassword);
+  updateString(in, "apSsidPrefix", next.apSsidPrefix); updateString(in, "apPassword", next.apPassword);
   if (!validateConfig(next, error)) return false;
   mechanicsChanged = next.motorStepsPerRev != config_.motorStepsPerRev || next.microsteps != config_.microsteps || next.gearboxRatio != config_.gearboxRatio || next.screwLeadMm != config_.screwLeadMm || next.stepsPerMmOverride != config_.stepsPerMmOverride || next.directionInverted != config_.directionInverted || next.measurementSign != config_.measurementSign || next.calibrationLengthMm != config_.calibrationLengthMm;
-  wifiChanged = next.wifiSsid != config_.wifiSsid || next.wifiPassword != config_.wifiPassword || next.fallbackApSsid != config_.fallbackApSsid || next.fallbackApPassword != config_.fallbackApPassword;
+  wifiChanged = next.apSsidPrefix != config_.apSsidPrefix || next.apPassword != config_.apPassword;
   config_ = next; return true;
 }

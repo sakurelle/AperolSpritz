@@ -1,15 +1,9 @@
 #pragma once
 
-#include <Arduino.h>
+#include "driver/gpio.h"
 
 namespace Pins {
-constexpr uint8_t LEFT_PIN = 2;
-constexpr uint8_t STOP_PIN = 1;
-constexpr uint8_t MEASURE_PIN = 0;
-constexpr uint8_t STEP_PIN = 3;
-constexpr uint8_t DIR_PIN = 4;
-constexpr uint8_t EN_PIN = 10;
-constexpr uint8_t CONTACT_PIN = 20;
-constexpr uint8_t CALIBRATE_PIN = 21;
-constexpr uint8_t NEEDLE_PIN = 8;
+constexpr gpio_num_t LEFT_PIN = GPIO_NUM_2; constexpr gpio_num_t STOP_PIN = GPIO_NUM_1; constexpr gpio_num_t MEASURE_PIN = GPIO_NUM_0;
+constexpr gpio_num_t STEP_PIN = GPIO_NUM_3; constexpr gpio_num_t DIR_PIN = GPIO_NUM_4; constexpr gpio_num_t EN_PIN = GPIO_NUM_10;
+constexpr gpio_num_t CONTACT_PIN = GPIO_NUM_20; constexpr gpio_num_t CALIBRATE_PIN = GPIO_NUM_21; constexpr gpio_num_t NEEDLE_PIN = GPIO_NUM_8;
 }  // namespace Pins

@@ -1,6 +1,7 @@
 #pragma once
 
-#include <Arduino.h>
+#include <cstdint>
+#include <string>
 
 struct DeviceConfig {
   uint16_t motorStepsPerRev = 200;
@@ -36,12 +37,8 @@ struct DeviceConfig {
   float deviationGreenPercent = 0.5F;
   float deviationRedPercent = 2.0F;
 
-  String wifiSsid;
-  String wifiPassword;
-  uint32_t wifiConnectTimeoutMs = 15000;
-  uint32_t wifiRetryIntervalMs = 60000;
-  String fallbackApSsid = "NeedleGauge";
-  String fallbackApPassword = "NeedleGauge2026";
+  std::string apSsidPrefix = "NeedleGauge";
+  std::string apPassword = "NeedleGauge2026";
 };
 
 inline float stepsPerMm(const DeviceConfig &c) {

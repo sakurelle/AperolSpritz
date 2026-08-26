@@ -4,7 +4,7 @@
 #include "esp_check.h"
 #include <algorithm>
 
-namespace { constexpr gpio_num_t STEP_PIN = GPIO_NUM_3, DIR_PIN = GPIO_NUM_4, EN_PIN = GPIO_NUM_10; constexpr const char *TAG = "stepper"; }
+namespace { constexpr gpio_num_t STEP_PIN = GPIO_NUM_6, DIR_PIN = GPIO_NUM_5, EN_PIN = GPIO_NUM_7; constexpr const char *TAG = "stepper"; }
 
 bool IRAM_ATTR StepperMotor::on_alarm(gptimer_handle_t, const gptimer_alarm_event_data_t *, void *arg) {
     auto *self = static_cast<StepperMotor *>(arg);

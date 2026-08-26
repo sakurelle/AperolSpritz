@@ -3,7 +3,7 @@
 #include "driver/gpio.h"
 #include "esp_check.h"
 
-namespace { constexpr gpio_num_t MEASURE_PIN=GPIO_NUM_0, STOP_PIN=GPIO_NUM_1, LEFT_PIN=GPIO_NUM_2, NEEDLE_PIN=GPIO_NUM_8, CONTACT_PIN=GPIO_NUM_20, CALIBRATE_PIN=GPIO_NUM_21; }
+namespace { constexpr gpio_num_t MEASURE_PIN=GPIO_NUM_1, STOP_PIN=GPIO_NUM_2, LEFT_PIN=GPIO_NUM_10, NEEDLE_PIN=GPIO_NUM_4, CONTACT_PIN=GPIO_NUM_3, CALIBRATE_PIN=GPIO_NUM_0; }
 
 esp_err_t GpioManager::init(QueueHandle_t queue, StepperMotor *motor) {
     queue_ = queue; motor_ = motor;

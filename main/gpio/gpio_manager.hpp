@@ -5,7 +5,7 @@
 #include "driver/gpio.h"
 class StepperMotor;
 
-enum class GpioEventType : uint8_t { MeasurePressed, CalibratePressed, LeftChanged, ContactActive, StopActive };
+enum class GpioEventType : uint8_t { MeasurePressed, CalibratePressed, LeftChanged, NeedleChanged, ContactActive, StopActive };
 struct GpioEvent { GpioEventType type; bool level_low; uint32_t timestamp_ms; };
 
 class GpioManager {
@@ -20,5 +20,5 @@ private:
     struct IsrContext { GpioManager *owner; gpio_num_t pin; };
     QueueHandle_t queue_ = nullptr;
     StepperMotor *motor_ = nullptr;
-    IsrContext contexts_[5]{};
+    IsrContext contexts_[6]{};
 };

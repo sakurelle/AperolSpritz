@@ -8,3 +8,4 @@ managed_components/
 .vscode/
 *.bak
 *.m3~
+secrets.txt

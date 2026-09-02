@@ -1,83 +1,106 @@
-# NeedleMeter — измеритель длины иглы на ESP32-C3
+# NeedleMeter — ESP32-C3 измеритель длины иглы
 
-Законченная прошивка на **ESP-IDF** (без Arduino) для измерения длины иглы с шаговым двигателем и драйвером TMC2209. PlatformIO поддерживается как среда сборки, прошивки и отладки. Управление двигателем использует только `STEP`, `DIR`, `EN`; импульсы STEP формирует `GPTimer`.
+Прошивка использует **ESP-IDF** через PlatformIO (framework = espidf). Импульсы TMC2209 формирует GPTimer; управление двигателем — только STEP, DIR, EN. Web UI и REST API передают команды конечному автомату FreeRTOS и не двигают мотор непосредственно.
 
-## Подключение
+## Актуальная распиновка
 
-| GPIO | Сигнал | Активное состояние |
+| GPIO | Сигнал | Логика |
 |---:|---|---|
-| 0 | MEASURE | LOW, начать измерение |
-| 1 | STOP | LOW, аварийное отключение |
-| 2 | LEFT | LOW, JOG влево пока удерживается |
-| 3 | STEP | выход TMC2209 |
-| 4 | DIR | выход TMC2209 |
-| 8 | NEEDLE | LOW, игла найдена |
-| 10 | EN | LOW включает TMC2209 |
-| 20 | CONTACT | LOW, измерительный контакт замкнут |
-| 21 | CALIBRATE | LOW, начать калибровку |
+| 0 | CALIBRATE | LOW — начать калибровку |
+| 1 | MEASURE | LOW — начать измерение |
+| 2 | STOP | LOW — аварийная остановка |
+| 3 | CONTACT | LOW — измерительный контакт замкнут на GND |
+| 4 | NEEDLE | LOW — игла обнаружена, HIGH — игла отсутствует |
+| 5 | DIR | выход TMC2209 |
+| 6 | STEP | выход TMC2209 |
+| 7 | EN | LOW включает TMC2209 |
+| 10 | LEFT / JOG | LOW — отъезд, пока удерживается |
 
-На всех входах с активным LOW включена внутренняя подтяжка вверх. На `STEP`, `DIR`, `EN` подтяжки не включаются.
+STEP=LOW, DIR=LOW, EN=HIGH устанавливаются до NVS, Wi‑Fi и создания задач. Это не затрагивает GPIO3/GPIO4/GPIO10: входы CONTACT, NEEDLE и LEFT никогда временно не становятся выходами.
 
-### Особенности GPIO ESP32-C3
+### Подключение NEEDLE
 
-Распиновка сохранена без изменений. При разработке платы учтите: GPIO2 и GPIO8 относятся к strapping-пинам ESP32-C3, GPIO4 используется по умолчанию как JTAG MTMS, а GPIO20/GPIO21 являются линиями UART0. Подключённая механика не должна навязывать неверные уровни на strapping-пинах при reset и не должна конфликтовать с программированием/отладкой.
+NEEDLE — независимый оптический датчик. Его подключение:
 
-## Работа
+    VCC → согласно питанию конкретного модуля
+    GND → общая GND
+    OUT → GPIO4
 
-При старте `EN=HIGH`, `STEP=LOW`, поэтому самопроизвольного движения нет. STOP обрабатывается GPIO-прерыванием: ISR немедленно ставит `EN=HIGH`, прекращает STEP и ставит флаг отмены. Конечный автомат затем безопасно останавливает GPTimer и переходит в `STOPPED`. Сброс возможен только после физического отпускания STOP через API/UI.
+GPIO4 — обычный цифровой вход без внутренней подтяжки: модуль сам формирует уровень. Фактически измеренная логика:
 
-Кнопки MEASURE и CALIBRATE имеют debounce. LEFT — только JOG, а не поиск нуля: абсолютного HOME в этой аппаратной конфигурации нет. При CONTACT во время измерения/калибровки импульсы прекращаются из ISR, после чего задача фиксирует число фронтов STEP. Контакт при ручном ходе также останавливает каретку (настройка `stop_manual_on_contact`).
+    NEEDLE OUT LOW  = игла обнаружена
+    NEEDLE OUT HIGH = игла отсутствует
 
-Калибровка движется до контакта с установленным калибром и сохраняет число шагов в NVS. После неё измеренная длина вычисляется централизованно:
+CONTACT GPIO3 — отдельный active-low вход с pullup: HIGH = свободен, LOW = измерительный контакт замкнут на GND. NEEDLE и CONTACT электрически независимы.
 
-`L = Lcal + measurement_sign × (Ncal − Nmeas) × mm_per_step`
+## Последовательность измерения и калибровки
 
-Настройте `mm_per_step`, `measurement_sign`, направления DIR и скорость по фактической механике. Это необходимые допущения: у устройства нет HOME-датчика, не задана геометрия передачи/микрошаг TMC2209 и не определено, какой знак соответствует увеличению длины.
+Измерение и калибровка используют одинаковую двухпроходную последовательность:
 
-## Wi‑Fi и Web UI
+    FAST_APPROACH → CONTACT → RETRACT
+                  → FINE_APPROACH → CONTACT → FINAL_RETRACT → FINISHED
 
-После загрузки контроллер поднимает AP:
+В итог берётся только координата CONTACT медленного (FINE) подхода. После каждого касания каретка уходит от зафиксированной точки CONTACT ровно на настраиваемое расстояние `retract_mm` (по умолчанию 2.0 мм), переведённое в шаги через `llround(retract_mm / mm_per_step)`. CONTACT должен разомкнуться к концу этого движения; иначе операция завершается ошибкой.
 
-- SSID: `NeedleMeter`
-- пароль: `NeedleMeter2026` (замените константу в `main/wifi/wifi_manager.cpp` перед эксплуатацией)
-- адрес интерфейса: `http://192.168.4.1/`
+Обычное измерение запускается только при обнаруженной игле (GPIO4 LOW) и продолжает контролировать оптический датчик в `MEASURE_FAST`, `MEASURE_RETRACT`, `MEASURE_FINE` и `MEASURE_FINAL_RETRACT`. Если GPIO4 остаётся HIGH не менее 5 мс, двигатель штатно останавливается, операция отменяется с `NEEDLE_NOT_FOUND`, а результат не сохраняется. CONTACT не меняет эту проверку. Калибровка и LEFT/JOG не зависят от NEEDLE.
 
-Страница обновляет статус каждые 500 ms без перезагрузки и даёт доступ к запуску операций, безопасному сбросу STOP/ошибки, настройкам и заводскому сбросу. API:
+Стандартные настройки: coarse 3000 шаг/с, fine 500 шаг/с, retract 1000 шаг/с, JOG 300 шаг/с, acceleration 6000 шаг/с². GPTimer остаётся генератором STEP; частота плавно возрастает из задачи FSM без blocking loop. STOP ISR немедленно сбрасывает STEP и устанавливает EN=HIGH из любого состояния.
 
-- `GET /api/status`, `GET /api/config`
-- `POST /api/config`, `/api/measure`, `/api/calibrate`, `/api/reset-stop`, `/api/reset-error`, `/api/factory-reset`
+LEFT/JOG всегда означает движение от контакта. Активный CONTACT не останавливает JOG и не создаёт цикл start/stop; отжатие LEFT даёт в лог JOG STOP reason=BUTTON_RELEASE.
 
-Все запросы управления только ставят команды в очередь FreeRTOS — HTTP-задача не выполняет движение двигателя.
+### Относительная координата
 
-## Сборка и прошивка
+position_steps — накопленная знаковая программная координата, обновляемая на каждом реально сформированном фронте STEP. Она не обнуляется между FAST, RETRACT, FINE и FINAL_RETRACT.
 
-## Сборка через PlatformIO
+Она **не является абсолютной координатой**: достоверна только пока мотор не пропускает шаги и каретка не перемещалась вручную или при выключенном питании. HOME-датчика в устройстве нет. Длина вычисляется по разнице точных координат калибра и измерения:
 
-Установите VS Code и расширение **PlatformIO IDE**, затем откройте корневую папку проекта. PlatformIO автоматически установит platform/framework; он используется только для сборки, прошивки и монитора, а сама прошивка остаётся проектом **ESP-IDF**.
+    L = calibration_length_mm + measurement_sign × (calibration_position − measurement_position) × mm_per_step
 
-```powershell
-pio run
-pio run -t upload
-pio device monitor
-```
+## Wi‑Fi
 
-Проект использует environment `esp32-c3-devkitm-1` (`framework = espidf`, ESP32-C3). Конкретный COM-порт не задан: PlatformIO определит его сам или предложит выбрать.
-Параметр `src_dir = main` указывает PlatformIO на нативный ESP-IDF component, поэтому исходники остаются в `main/` и подключаются существующим ESP-IDF CMake.
+Если build-time credentials настроены, устройство сначала подключается к лабораторной сети в режиме STA, получает DHCP-адрес и выводит SSID/IP. Поддерживаются:
 
-### Console и занятые GPIO
+- WPA2-PSK;
+- WPA2-Enterprise (PEAP, identity/username/password) через ESP-IDF esp_eap_client.
 
-В `sdkconfig.defaults` console перенесена на встроенный **USB Serial/JTAG** ESP32-C3. Это освобождает GPIO20 (`CONTACT`) и GPIO21 (`CALIBRATE`) от UART0; для логов используйте USB Serial/JTAG port, появляющийся после подключения платы по USB. Не используйте UART0 console на этих двух выводах.
+При отсутствии credentials, ошибке конфигурации или таймауте подключения запускается fallback AP:
 
-При корректном запуске monitor должен показать: запуск AP, `SSID: NeedleMeter`, `IP: 192.168.4.1`, затем `HTTP handlers registered: 9` и `HTTP server started`.
+    SSID: NeedleMeter
+    IP:   192.168.4.1
 
-## Альтернативная сборка ESP-IDF
+После потери STA-сети включается reconnect; работа кнопок и FSM от Wi‑Fi не зависит. /api/status и Web UI показывают режим Wi‑Fi и текущий IP. Пароль никогда не попадает в REST API, Web UI или log.
 
-Откройте корень проекта в VS Code с расширением Espressif IDF, выберите target `esp32c3`, затем **Build**, **Flash**, **Monitor**. Эквивалент в ESP-IDF Command Prompt:
+### secrets.txt
 
-```powershell
-idf.py set-target esp32c3
-idf.py build
-idf.py -p COMx flash monitor
-```
+Скопируйте [secrets.example.txt](secrets.example.txt) в secrets.txt и укажите реальные данные. secrets.txt игнорируется Git и при сборке CMake создаёт заголовок только в build directory.
 
-Основные состояния: `IDLE`, `MANUAL_LEFT`, `MEASURING`, `CALIBRATING`, `FINISHED`, `STOPPED`, `ERROR`. Перед измерением обязательны отпущенный STOP, незамкнутый CONTACT, обнаруженная игла и действующая калибровка. Ограничения шагов и timeout предотвращают бесконечное движение.
+    WIFI_AUTH=enterprise
+    WIFI_SSID=LAB_SSID
+    WIFI_IDENTITY=my_login
+    WIFI_USERNAME=my_login
+    WIFI_PASSWORD=my_password
+
+Для WPA2-PSK:
+
+    WIFI_AUTH=psk
+    WIFI_SSID=LAB_SSID
+    WIFI_PASSWORD=my_password
+
+Если файла нет или значения не заполнены, сборка остаётся рабочей и используется fallback AP.
+
+## Web UI и API
+
+Откройте http://<IP>/. Страница показывает фазу FSM, текущую скорость, программную координату, NEEDLE, CONTACT, последнее точное измерение, Wi‑Fi/IP и статистику. Настраиваемые coarse/fine/retract/JOG скорости, ускорение, отъезд и timeout сохраняются в NVS через POST /api/config.
+
+API:
+
+- GET /api/status, GET /api/config
+- POST /api/config, /api/measure, /api/calibrate, /api/reset-stop, /api/reset-error, /api/factory-reset
+
+## Сборка
+
+    pio run
+    pio run -t upload
+    pio device monitor
+
+ESP32-C3 console работает через USB Serial/JTAG, поэтому GPIO20/GPIO21 не заняты UART console.

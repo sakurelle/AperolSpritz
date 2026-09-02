@@ -1,5 +1,6 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "config/pins.hpp"
 #include "config/config_storage.hpp"
 #include "gpio/gpio_manager.hpp"
 #include "motor/stepper_motor.hpp"
@@ -19,11 +20,12 @@ static WebServer web;
 extern "C" void app_main(void) {
     // Put the driver in a safe electrical state before NVS, Wi-Fi, or any task can run.
     gpio_config_t safety{};
-    safety.pin_bit_mask = (1ULL << GPIO_NUM_3) | (1ULL << GPIO_NUM_4) | (1ULL << GPIO_NUM_10);
+    safety.pin_bit_mask = (1ULL << STEP_PIN) | (1ULL << DIR_PIN) | (1ULL << EN_PIN);
     safety.mode = GPIO_MODE_OUTPUT;
     ESP_ERROR_CHECK(gpio_config(&safety));
-    ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_3, 0));
-    ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_10, 1)); // TMC2209 EN is active LOW
+    ESP_ERROR_CHECK(gpio_set_level(STEP_PIN, 0));
+    ESP_ERROR_CHECK(gpio_set_level(DIR_PIN, 0));
+    ESP_ERROR_CHECK(gpio_set_level(EN_PIN, 1)); // TMC2209 EN is active LOW
 
     if (storage.init() != ESP_OK) { ESP_LOGE(TAG, "NVS initialization failed; motor remains disabled"); return; }
     DeviceConfig config; DeviceStats stats; bool defaults = false;
@@ -34,6 +36,6 @@ extern "C" void app_main(void) {
     if (controller.init(&motor, &gpio, &storage, config, stats) != ESP_OK) { ESP_LOGE(TAG, "GPIO/controller initialization failed"); motor.stop(); return; }
     if (controller.start_task() != ESP_OK) { ESP_LOGE(TAG, "Controller task initialization failed"); motor.stop(); return; }
 
-    if (wifi.start_access_point() != ESP_OK) { ESP_LOGE(TAG, "Wi-Fi AP failed; physical controls remain active"); return; }
-    if (web.start(&controller) != ESP_OK) ESP_LOGE(TAG, "HTTP server unavailable; physical controls remain active");
+    if (wifi.start() != ESP_OK) ESP_LOGE(TAG, "Wi-Fi unavailable; physical controls remain active");
+    if (web.start(&controller, &wifi) != ESP_OK) ESP_LOGE(TAG, "HTTP server unavailable; physical controls remain active");
 }

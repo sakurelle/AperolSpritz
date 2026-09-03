@@ -19,6 +19,9 @@ enum class DeviceState : uint8_t {
     CALIBRATE_RETRACT,
     CALIBRATE_FINE,
     CALIBRATE_FINAL_RETRACT,
+    AUTO_WAIT_NEEDLE,
+    AUTO_WAIT_REMOVE,
+    AUTO_MOVE_TO_LOAD,
     MANUAL_LEFT,
     FINISHED,
     STOPPED,
@@ -34,12 +37,13 @@ enum class ErrorCode : uint8_t {
     CalibrationTimeout,
     MaxStepsReached,
     NotCalibrated,
+    NeedleInsertedDuringAutocal,
     StopActive,
     InvalidConfig,
     InternalError,
 };
 
-enum class CommandType : uint8_t { Measure, Calibrate, ResetStop, ResetError, FactoryReset };
+enum class CommandType : uint8_t { Measure, Calibrate, AutoStart, AutoStop, ResetStop, ResetError, FactoryReset };
 struct ControllerCommand { CommandType type; };
 
 struct StatusSnapshot {
@@ -49,6 +53,8 @@ struct StatusSnapshot {
     bool contact;
     bool stop_active;
     bool motor_enabled;
+    bool auto_mode_enabled;
+    const char *auto_phase;
     uint32_t current_speed_steps_s;
     int64_t position_steps;
     DeviceStats stats;
@@ -70,7 +76,7 @@ private:
     void process_gpio(const GpioEvent &);
     void process_command(const ControllerCommand &);
     void tick();
-    void start_operation(bool calibration);
+    void start_operation(bool calibration, bool automatic = false);
     bool start_motion(DeviceState state, bool direction_positive, uint32_t speed, uint32_t max_steps, bool stop_on_contact);
     void handle_contact();
     void start_retract(bool final_retract);
@@ -78,12 +84,18 @@ private:
     void evaluate_measurement_needle(uint32_t now);
     uint32_t retract_steps_from_config() const;
     void finish_operation();
+    void start_auto_calibration();
+    void start_auto_load_position();
+    void enter_auto_wait_needle();
+    void tick_auto(uint32_t now);
+    void set_auto_enabled(bool enabled);
     void fail(ErrorCode);
     void safe_stop();
     bool debounced(uint32_t now, uint32_t &last) const;
     bool is_approach() const;
     bool is_measurement() const;
     bool is_retract() const;
+    bool is_auto_calibration() const;
 
     StepperMotor *motor_ = nullptr;
     GpioManager *gpio_ = nullptr;
@@ -107,6 +119,11 @@ private:
     int64_t retract_target_position_steps_ = 0;
     bool measurement_result_pending_ = false;
     DeviceStats pending_measurement_stats_{};
+    bool auto_mode_enabled_ = false;
+    bool operation_auto_ = false;
+    bool operation_calibration_ = false;
+    uint32_t needle_stable_since_ms_ = 0;
+    uint32_t auto_load_steps_ = 0;
 };
 
 const char *state_name(DeviceState);

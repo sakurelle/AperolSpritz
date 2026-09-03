@@ -19,6 +19,7 @@ enum class DeviceState : uint8_t {
     CALIBRATE_RETRACT,
     CALIBRATE_FINE,
     CALIBRATE_FINAL_RETRACT,
+    AUTO_WAIT_SENSOR_CLEAR,
     AUTO_WAIT_NEEDLE,
     AUTO_WAIT_REMOVE,
     AUTO_MOVE_TO_LOAD,
@@ -37,7 +38,6 @@ enum class ErrorCode : uint8_t {
     CalibrationTimeout,
     MaxStepsReached,
     NotCalibrated,
-    NeedleInsertedDuringAutocal,
     StopActive,
     InvalidConfig,
     InternalError,
@@ -86,7 +86,7 @@ private:
     void finish_operation();
     void start_auto_calibration();
     void start_auto_load_position();
-    void enter_auto_wait_needle();
+    void enter_auto_wait_sensor_clear();
     void tick_auto(uint32_t now);
     void set_auto_enabled(bool enabled);
     void fail(ErrorCode);
@@ -95,7 +95,7 @@ private:
     bool is_approach() const;
     bool is_measurement() const;
     bool is_retract() const;
-    bool is_auto_calibration() const;
+    bool needle_level_stable(bool expected_present, uint32_t now, uint32_t &since_ms) const;
 
     StepperMotor *motor_ = nullptr;
     GpioManager *gpio_ = nullptr;
@@ -122,7 +122,9 @@ private:
     bool auto_mode_enabled_ = false;
     bool operation_auto_ = false;
     bool operation_calibration_ = false;
-    uint32_t needle_stable_since_ms_ = 0;
+    uint32_t needle_present_since_ms_ = 0;
+    uint32_t needle_absent_since_ms_ = 0;
+    uint32_t sensor_clear_since_ms_ = 0;
     uint32_t auto_load_steps_ = 0;
 };
 

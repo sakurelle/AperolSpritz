@@ -21,7 +21,7 @@ const char *state_name(DeviceState state) {
     case DeviceState::MEASURE_FINE: return "MEASURE_FINE"; case DeviceState::MEASURE_FINAL_RETRACT: return "MEASURE_FINAL_RETRACT";
     case DeviceState::CALIBRATE_FAST: return "CALIBRATE_FAST"; case DeviceState::CALIBRATE_RETRACT: return "CALIBRATE_RETRACT";
     case DeviceState::CALIBRATE_FINE: return "CALIBRATE_FINE"; case DeviceState::CALIBRATE_FINAL_RETRACT: return "CALIBRATE_FINAL_RETRACT";
-    case DeviceState::AUTO_WAIT_NEEDLE: return "AUTO_WAIT_NEEDLE"; case DeviceState::AUTO_WAIT_REMOVE: return "AUTO_WAIT_REMOVE"; case DeviceState::AUTO_MOVE_TO_LOAD: return "AUTO_MOVE_TO_LOAD";
+    case DeviceState::AUTO_WAIT_SENSOR_CLEAR: return "AUTO_WAIT_SENSOR_CLEAR"; case DeviceState::AUTO_WAIT_NEEDLE: return "AUTO_WAIT_NEEDLE"; case DeviceState::AUTO_WAIT_REMOVE: return "AUTO_WAIT_REMOVE"; case DeviceState::AUTO_MOVE_TO_LOAD: return "AUTO_MOVE_TO_LOAD";
     case DeviceState::MANUAL_LEFT: return "MANUAL_LEFT"; case DeviceState::FINISHED: return "FINISHED"; case DeviceState::STOPPED: return "STOPPED"; case DeviceState::ERROR: return "ERROR";
     } return "ERROR";
 }
@@ -30,7 +30,7 @@ const char *error_name(ErrorCode error) {
     case ErrorCode::None: return "NONE"; case ErrorCode::NeedleNotFound: return "NEEDLE_NOT_FOUND"; case ErrorCode::ContactAlreadyActive: return "CONTACT_ALREADY_ACTIVE";
     case ErrorCode::ContactReleaseTimeout: return "CONTACT_RELEASE_TIMEOUT"; case ErrorCode::MeasurementTimeout: return "MEASUREMENT_TIMEOUT"; case ErrorCode::CalibrationTimeout: return "CALIBRATION_TIMEOUT";
     case ErrorCode::MaxStepsReached: return "MAX_STEPS_REACHED"; case ErrorCode::NotCalibrated: return "NOT_CALIBRATED"; case ErrorCode::StopActive: return "STOP_ACTIVE";
-    case ErrorCode::InvalidConfig: return "INVALID_CONFIG"; case ErrorCode::NeedleInsertedDuringAutocal: return "NEEDLE_INSERTED_DURING_AUTOCAL"; case ErrorCode::InternalError: return "INTERNAL_ERROR";
+    case ErrorCode::InvalidConfig: return "INVALID_CONFIG"; case ErrorCode::InternalError: return "INTERNAL_ERROR";
     } return "INTERNAL_ERROR";
 }
 
@@ -59,13 +59,17 @@ bool MeasurementController::update_config(const DeviceConfig &config, const char
 bool MeasurementController::snapshot(StatusSnapshot &out) {
     if (!mutex_ || !gpio_ || !motor_) return false;
     xSemaphoreTake(mutex_, portMAX_DELAY);
-    const char *phase = !auto_mode_enabled_ ? "OFF" : state_ == DeviceState::AUTO_WAIT_NEEDLE ? "AUTO_WAIT_NEEDLE" : state_ == DeviceState::AUTO_WAIT_REMOVE ? "AUTO_WAIT_REMOVE" : state_ == DeviceState::AUTO_MOVE_TO_LOAD ? "AUTO_MOVE_TO_LOAD" : operation_auto_ && operation_calibration_ ? "AUTO_CALIBRATING" : operation_auto_ ? "AUTO_MEASURING" : "AUTO_READY";
+    const char *phase = !auto_mode_enabled_ ? "ВЫКЛ" : state_ == DeviceState::AUTO_WAIT_SENSOR_CLEAR ? "Ожидание освобождения датчика" : state_ == DeviceState::AUTO_WAIT_NEEDLE ? "Ожидание иглы" : state_ == DeviceState::AUTO_WAIT_REMOVE ? "Ожидание снятия иглы" : state_ == DeviceState::AUTO_MOVE_TO_LOAD ? "Возврат в загрузочную позицию" : operation_auto_ && operation_calibration_ ? "Автокалибровка" : operation_auto_ ? "Автоматическое измерение" : "Готов";
     out = {state_, error_, gpio_->needle_present(), gpio_->contact_active(), gpio_->stop_active(), motor_->is_enabled(), auto_mode_enabled_, phase, motor_->current_speed_steps_s(), motor_->position_steps(), stats_, config_}; xSemaphoreGive(mutex_); return true;
 }
 double MeasurementController::calculate_length(int64_t p) const { return stats_.calibration_reference_length_mm + motion_config::MEASUREMENT_SIGN * static_cast<double>(stats_.calibration_contact_position_steps - p) * motion_config::MM_PER_STEP; }
 bool MeasurementController::debounced(uint32_t now, uint32_t &last) const { if (now - last < motion_config::NEEDLE_DEBOUNCE_MS) return false; last = now; return true; }
 bool MeasurementController::is_measurement() const { return state_ == DeviceState::MEASURE_FAST || state_ == DeviceState::MEASURE_RETRACT || state_ == DeviceState::MEASURE_FINE || state_ == DeviceState::MEASURE_FINAL_RETRACT; }
-bool MeasurementController::is_auto_calibration() const { return operation_auto_ && operation_calibration_ && (state_ == DeviceState::CALIBRATE_FAST || state_ == DeviceState::CALIBRATE_RETRACT || state_ == DeviceState::CALIBRATE_FINE); }
+bool MeasurementController::needle_level_stable(bool expected_present, uint32_t now, uint32_t &since_ms) const {
+    if (gpio_->needle_present() != expected_present) { since_ms = 0; return false; }
+    if (since_ms == 0) { since_ms = now; return false; }
+    return now - since_ms >= motion_config::NEEDLE_DEBOUNCE_MS;
+}
 bool MeasurementController::is_approach() const { return state_ == DeviceState::MEASURE_FAST || state_ == DeviceState::MEASURE_FINE || state_ == DeviceState::CALIBRATE_FAST || state_ == DeviceState::CALIBRATE_FINE; }
 bool MeasurementController::is_retract() const { return state_ == DeviceState::MEASURE_RETRACT || state_ == DeviceState::MEASURE_FINAL_RETRACT || state_ == DeviceState::CALIBRATE_RETRACT || state_ == DeviceState::CALIBRATE_FINAL_RETRACT; }
 
@@ -73,7 +77,6 @@ void MeasurementController::run() { last_tick_ms_ = now_ms(); ESP_LOGI(TAG, "Con
 void MeasurementController::process_gpio(const GpioEvent &e) {
     const uint32_t now = now_ms();
     if (e.type == GpioEventType::StopActive && e.level_low) { safe_stop(); set_auto_enabled(false); state_ = DeviceState::STOPPED; error_ = ErrorCode::StopActive; return; }
-    if (e.type == GpioEventType::NeedleChanged && is_auto_calibration() && gpio_->needle_present()) { fail(ErrorCode::NeedleInsertedDuringAutocal); return; }
     if (e.type == GpioEventType::NeedleChanged && is_measurement()) { evaluate_measurement_needle(now); return; }
     if (e.type == GpioEventType::ContactActive && is_approach() && gpio_->contact_active()) { if (is_measurement() && !gpio_->needle_present()) { fail(ErrorCode::NeedleNotFound); return; } handle_contact(); return; }
     if (!auto_mode_enabled_) { if (e.type == GpioEventType::MeasurePressed && e.level_low && debounced(now, last_measure_ms_)) start_operation(false); if (e.type == GpioEventType::CalibratePressed && e.level_low && debounced(now, last_calibrate_ms_)) start_operation(true); }
@@ -81,7 +84,18 @@ void MeasurementController::process_gpio(const GpioEvent &e) {
 void MeasurementController::process_command(const ControllerCommand &c) {
     switch (c.type) {
     case CommandType::Measure: if (!auto_mode_enabled_) start_operation(false); break; case CommandType::Calibrate: if (!auto_mode_enabled_) start_operation(true); break;
-    case CommandType::AutoStart: if (state_ != DeviceState::STOPPED && state_ != DeviceState::ERROR && (state_ == DeviceState::IDLE || state_ == DeviceState::FINISHED)) { set_auto_enabled(true); state_ = gpio_->needle_present() && stats_.calibration_valid ? DeviceState::AUTO_WAIT_NEEDLE : DeviceState::AUTO_WAIT_REMOVE; needle_stable_since_ms_ = now_ms(); ESP_LOGI(TAG, "AUTO: enabled"); } break;
+    case CommandType::AutoStart:
+        if (state_ != DeviceState::STOPPED && state_ != DeviceState::ERROR && (state_ == DeviceState::IDLE || state_ == DeviceState::FINISHED)) {
+            const bool needle_present = gpio_->needle_present();
+            set_auto_enabled(true);
+            needle_present_since_ms_ = 0;
+            needle_absent_since_ms_ = 0;
+            sensor_clear_since_ms_ = 0;
+            state_ = needle_present && stats_.calibration_valid ? DeviceState::AUTO_WAIT_NEEDLE : DeviceState::AUTO_WAIT_REMOVE;
+            ESP_LOGI(TAG, "AUTO: enabled, needle=%s, calibration_valid=%d", needle_present ? "present" : "absent", stats_.calibration_valid);
+            if (state_ == DeviceState::AUTO_WAIT_REMOVE) ESP_LOGI(TAG, "AUTO: waiting for needle removal");
+        }
+        break;
     case CommandType::AutoStop: safe_stop(); set_auto_enabled(false); state_ = DeviceState::IDLE; error_ = ErrorCode::None; break;
     case CommandType::ResetStop: if (state_ == DeviceState::STOPPED && !gpio_->stop_active()) { motor_->clear_stop_latch(); motor_->clear_abort(); state_ = DeviceState::IDLE; error_ = ErrorCode::None; } break;
     case CommandType::ResetError: if (state_ == DeviceState::ERROR) { motor_->clear_abort(); state_ = DeviceState::IDLE; error_ = ErrorCode::None; } break;
@@ -92,7 +106,7 @@ bool MeasurementController::start_motion(DeviceState s, bool pos, uint32_t speed
 void MeasurementController::start_operation(bool cal, bool automatic) {
     if ((state_ != DeviceState::IDLE && state_ != DeviceState::FINISHED && !automatic) || gpio_->stop_active()) { if (gpio_->stop_active()) { safe_stop(); set_auto_enabled(false); state_ = DeviceState::STOPPED; error_ = ErrorCode::StopActive; } return; }
     if (!cal && (!gpio_->needle_present() || !stats_.calibration_valid)) { fail(!gpio_->needle_present() ? ErrorCode::NeedleNotFound : ErrorCode::NotCalibrated); return; }
-    if (cal && automatic && gpio_->needle_present()) { fail(ErrorCode::NeedleInsertedDuringAutocal); return; } if (gpio_->contact_active()) { fail(ErrorCode::ContactAlreadyActive); return; }
+    if (gpio_->contact_active()) { fail(ErrorCode::ContactAlreadyActive); return; }
     operation_auto_ = automatic; operation_calibration_ = cal; error_ = ErrorCode::None; optical_absence_started_ms_ = 0; measurement_result_pending_ = false; operation_started_ms_ = now_ms();
     ESP_LOGI(TAG, "%s", automatic ? (cal ? "AUTO: calibration started" : "AUTO: measurement started") : (cal ? "MANUAL: calibration started" : "MANUAL: measurement started"));
     start_motion(cal ? DeviceState::CALIBRATE_FAST : DeviceState::MEASURE_FAST, config_.measure_dir_inverted, motion_config::COARSE_SPEED_STEPS_S, cal ? motion_config::MAX_CALIBRATION_STEPS : motion_config::MAX_MEASUREMENT_STEPS, true);
@@ -105,14 +119,31 @@ void MeasurementController::handle_contact() {
 }
 void MeasurementController::start_retract(bool final) { const bool cal = operation_calibration_; retract_total_steps_ = retract_steps_from_config(); if (!retract_total_steps_ || retract_total_steps_ > motion_config::MAX_RETRACT_STEPS) { fail(ErrorCode::MaxStepsReached); return; } const bool pos = !config_.measure_dir_inverted; if (final) { retract_next_state_ = DeviceState::FINISHED; state_ = cal ? DeviceState::CALIBRATE_FINAL_RETRACT : DeviceState::MEASURE_FINAL_RETRACT; } else { retract_next_state_ = cal ? DeviceState::CALIBRATE_FINE : DeviceState::MEASURE_FINE; state_ = cal ? DeviceState::CALIBRATE_RETRACT : DeviceState::MEASURE_RETRACT; } start_motion(state_, pos, motion_config::RETRACT_SPEED_STEPS_S, retract_total_steps_, false); }
 void MeasurementController::tick_retract(uint32_t now) { if (gpio_->contact_active() && now - phase_started_ms_ >= motion_config::CONTACT_RELEASE_TIMEOUT_MS) { fail(ErrorCode::ContactReleaseTimeout); return; } if (motor_->completed_steps() < retract_total_steps_) return; safe_stop(); if (gpio_->contact_active()) { fail(ErrorCode::ContactReleaseTimeout); return; } if (retract_next_state_ == DeviceState::FINISHED) { finish_operation(); return; } optical_absence_started_ms_ = 0; start_motion(retract_next_state_, config_.measure_dir_inverted, motion_config::FINE_SPEED_STEPS_S, retract_next_state_ == DeviceState::CALIBRATE_FINE ? motion_config::MAX_CALIBRATION_STEPS : motion_config::MAX_MEASUREMENT_STEPS, true); }
-void MeasurementController::finish_operation() { if (measurement_result_pending_) { if (!gpio_->needle_present()) { fail(ErrorCode::NeedleNotFound); return; } if (storage_->save_stats(pending_measurement_stats_) != ESP_OK) { fail(ErrorCode::InternalError); return; } stats_ = pending_measurement_stats_; measurement_result_pending_ = false; ESP_LOGI(TAG, "AUTO: measurement completed length=%.3f", stats_.last_measured_length); } if (operation_auto_ && !operation_calibration_) { state_ = DeviceState::AUTO_WAIT_REMOVE; needle_stable_since_ms_ = now_ms(); ESP_LOGI(TAG, "AUTO: waiting for needle removal"); return; } operation_auto_ = false; operation_calibration_ = false; state_ = DeviceState::FINISHED; error_ = ErrorCode::None; }
-void MeasurementController::start_auto_calibration() { if (!auto_mode_enabled_ || gpio_->needle_present()) { if (gpio_->needle_present()) fail(ErrorCode::NeedleInsertedDuringAutocal); return; } start_operation(true, true); }
-void MeasurementController::start_auto_load_position() { const double delta = motion_config::AUTO_LOAD_POSITION_MM - config_.auto_calibration_length_mm, raw = delta / motion_config::MM_PER_STEP; if (!std::isfinite(delta) || !std::isfinite(raw) || delta <= 0 || delta > 30 || raw <= 0 || raw > motion_config::MAX_AUTO_LOAD_STEPS) { fail(ErrorCode::MaxStepsReached); return; } auto_load_steps_ = static_cast<uint32_t>(std::llround(raw)); ESP_LOGI(TAG, "AUTO: moving to load position %.3f mm (%lu steps)", motion_config::AUTO_LOAD_POSITION_MM, static_cast<unsigned long>(auto_load_steps_)); start_motion(DeviceState::AUTO_MOVE_TO_LOAD, !config_.measure_dir_inverted, motion_config::RETRACT_SPEED_STEPS_S, auto_load_steps_, false); }
-void MeasurementController::enter_auto_wait_needle() { state_ = DeviceState::AUTO_WAIT_NEEDLE; operation_auto_ = false; operation_calibration_ = false; needle_stable_since_ms_ = now_ms(); ESP_LOGI(TAG, "AUTO: waiting for next needle"); }
+void MeasurementController::finish_operation() { if (measurement_result_pending_) { if (!gpio_->needle_present()) { fail(ErrorCode::NeedleNotFound); return; } if (storage_->save_stats(pending_measurement_stats_) != ESP_OK) { fail(ErrorCode::InternalError); return; } stats_ = pending_measurement_stats_; measurement_result_pending_ = false; ESP_LOGI(TAG, "%s: measurement completed length=%.3f", operation_auto_ ? "AUTO" : "MANUAL", stats_.last_measured_length); } if (operation_auto_ && !operation_calibration_) { state_ = DeviceState::AUTO_WAIT_REMOVE; needle_absent_since_ms_ = 0; ESP_LOGI(TAG, "AUTO: waiting for needle removal"); return; } operation_auto_ = false; operation_calibration_ = false; state_ = DeviceState::FINISHED; error_ = ErrorCode::None; }
+void MeasurementController::start_auto_calibration() { if (!auto_mode_enabled_) return; start_operation(true, true); }
+void MeasurementController::start_auto_load_position() { const double delta = motion_config::AUTO_LOAD_POSITION_MM - config_.auto_calibration_length_mm, raw = delta / motion_config::MM_PER_STEP; if (!std::isfinite(delta) || !std::isfinite(raw) || delta <= 0 || delta > 30 || raw <= 0 || raw > motion_config::MAX_AUTO_LOAD_STEPS) { fail(ErrorCode::MaxStepsReached); return; } auto_load_steps_ = static_cast<uint32_t>(std::llround(raw)); ESP_LOGI(TAG, "AUTO: calibration completed"); ESP_LOGI(TAG, "AUTO: moving to load position %.3f mm (%lu steps)", motion_config::AUTO_LOAD_POSITION_MM, static_cast<unsigned long>(auto_load_steps_)); start_motion(DeviceState::AUTO_MOVE_TO_LOAD, !config_.measure_dir_inverted, motion_config::RETRACT_SPEED_STEPS_S, auto_load_steps_, false); }
+void MeasurementController::enter_auto_wait_sensor_clear() { state_ = DeviceState::AUTO_WAIT_SENSOR_CLEAR; operation_auto_ = false; operation_calibration_ = false; sensor_clear_since_ms_ = 0; needle_present_since_ms_ = 0; ESP_LOGI(TAG, "AUTO: waiting for optical sensor clear"); }
 void MeasurementController::set_auto_enabled(bool enabled) { auto_mode_enabled_ = enabled; if (!enabled) { operation_auto_ = false; operation_calibration_ = false; } }
-void MeasurementController::tick_auto(uint32_t now) { if (!auto_mode_enabled_) return; if (state_ == DeviceState::AUTO_WAIT_NEEDLE) { if (!gpio_->needle_present()) { needle_stable_since_ms_ = now; return; } if (now - needle_stable_since_ms_ >= motion_config::NEEDLE_DEBOUNCE_MS) { if (stats_.calibration_valid) { ESP_LOGI(TAG, "AUTO: needle detected"); start_operation(false, true); } else { state_ = DeviceState::AUTO_WAIT_REMOVE; needle_stable_since_ms_ = now; ESP_LOGI(TAG, "AUTO: remove needle for calibration"); } } } else if (state_ == DeviceState::AUTO_WAIT_REMOVE) { if (gpio_->needle_present()) { needle_stable_since_ms_ = now; return; } if (now - needle_stable_since_ms_ >= motion_config::NEEDLE_DEBOUNCE_MS) { ESP_LOGI(TAG, "AUTO: needle removed"); start_auto_calibration(); } } else if (state_ == DeviceState::AUTO_MOVE_TO_LOAD) { if (gpio_->needle_present()) { fail(ErrorCode::NeedleInsertedDuringAutocal); return; } if (gpio_->contact_active() && now - phase_started_ms_ >= motion_config::CONTACT_RELEASE_TIMEOUT_MS) { fail(ErrorCode::ContactReleaseTimeout); return; } if (motor_->limit_reached()) { fail(ErrorCode::MaxStepsReached); return; } if (motor_->completed_steps() >= auto_load_steps_) { safe_stop(); if (gpio_->contact_active()) { fail(ErrorCode::ContactReleaseTimeout); return; } ESP_LOGI(TAG, "AUTO: load position reached"); enter_auto_wait_needle(); } } }
+void MeasurementController::tick_auto(uint32_t now) {
+    if (!auto_mode_enabled_) return;
+    if (state_ == DeviceState::AUTO_WAIT_REMOVE) {
+        if (!gpio_->needle_present() && needle_absent_since_ms_ == 0) ESP_LOGI(TAG, "AUTO: needle absent candidate");
+        if (needle_level_stable(false, now, needle_absent_since_ms_)) { ESP_LOGI(TAG, "AUTO: needle removed confirmed"); start_auto_calibration(); }
+    } else if (state_ == DeviceState::AUTO_MOVE_TO_LOAD) {
+        if (gpio_->contact_active() && now - phase_started_ms_ >= motion_config::CONTACT_RELEASE_TIMEOUT_MS) { fail(ErrorCode::ContactReleaseTimeout); return; }
+        if (now - phase_started_ms_ >= motion_config::CALIBRATION_TIMEOUT_MS) { fail(ErrorCode::CalibrationTimeout); return; }
+        if (motor_->limit_reached()) { fail(ErrorCode::MaxStepsReached); return; }
+        if (motor_->completed_steps() >= auto_load_steps_) { safe_stop(); if (gpio_->contact_active()) { fail(ErrorCode::ContactReleaseTimeout); return; } ESP_LOGI(TAG, "AUTO: load position reached"); enter_auto_wait_sensor_clear(); }
+    } else if (state_ == DeviceState::AUTO_WAIT_SENSOR_CLEAR) {
+        if (gpio_->needle_present()) { sensor_clear_since_ms_ = 0; return; }
+        if (needle_level_stable(false, now, sensor_clear_since_ms_)) { state_ = DeviceState::AUTO_WAIT_NEEDLE; needle_present_since_ms_ = 0; ESP_LOGI(TAG, "AUTO: optical sensor clear; armed for next needle"); }
+    } else if (state_ == DeviceState::AUTO_WAIT_NEEDLE) {
+        if (gpio_->needle_present() && needle_present_since_ms_ == 0) ESP_LOGI(TAG, "AUTO: needle present candidate");
+        if (needle_level_stable(true, now, needle_present_since_ms_)) { ESP_LOGI(TAG, "AUTO: needle detected confirmed"); start_operation(false, true); }
+    }
+}
 void MeasurementController::safe_stop() { motor_->stop(); }
 void MeasurementController::fail(ErrorCode e) { safe_stop(); measurement_result_pending_ = false; if (auto_mode_enabled_) set_auto_enabled(false); error_ = e; state_ = DeviceState::ERROR; ESP_LOGW(TAG, "%s", error_name(e)); }
 uint32_t MeasurementController::retract_steps_from_config() const { const double raw = config_.retract_mm / motion_config::MM_PER_STEP; return std::isfinite(raw) && raw > 0 && raw <= UINT32_MAX ? static_cast<uint32_t>(std::llround(raw)) : 0; }
 void MeasurementController::evaluate_measurement_needle(uint32_t now) { if (!is_measurement()) return; if (gpio_->needle_present()) { optical_absence_started_ms_ = 0; return; } if (!optical_absence_started_ms_) { optical_absence_started_ms_ = now; return; } if (now - optical_absence_started_ms_ >= OPTICAL_NEEDLE_LOSS_DEBOUNCE_MS) fail(ErrorCode::NeedleNotFound); }
-void MeasurementController::tick() { const uint32_t now = now_ms(), elapsed = now - last_tick_ms_; last_tick_ms_ = now; if (gpio_->stop_active() && state_ != DeviceState::STOPPED) { motor_->emergency_stop_isr(); set_auto_enabled(false); state_ = DeviceState::STOPPED; error_ = ErrorCode::StopActive; return; } if (is_auto_calibration() && gpio_->needle_present()) { fail(ErrorCode::NeedleInsertedDuringAutocal); return; } if (is_measurement()) { evaluate_measurement_needle(now); if (!is_measurement()) return; } motor_->ramp_tick(elapsed); if (is_approach()) { if (gpio_->contact_active()) { if (is_measurement() && !gpio_->needle_present()) { fail(ErrorCode::NeedleNotFound); return; } handle_contact(); return; } if (motor_->limit_reached()) { fail(ErrorCode::MaxStepsReached); return; } if (now - operation_started_ms_ >= (is_measurement() ? motion_config::MEASUREMENT_TIMEOUT_MS : motion_config::CALIBRATION_TIMEOUT_MS)) { fail(is_measurement() ? ErrorCode::MeasurementTimeout : ErrorCode::CalibrationTimeout); return; } } else if (is_retract()) { tick_retract(now); return; } tick_auto(now); if (auto_mode_enabled_) return; const bool left = gpio_->left_pressed(); if (state_ == DeviceState::IDLE && left) start_motion(DeviceState::MANUAL_LEFT, !config_.measure_dir_inverted, motion_config::JOG_SPEED_STEPS_S, UINT32_MAX, false); if (state_ == DeviceState::MANUAL_LEFT && !left) { safe_stop(); state_ = DeviceState::IDLE; } if (state_ == DeviceState::FINISHED) state_ = DeviceState::IDLE; }
+void MeasurementController::tick() { const uint32_t now = now_ms(), elapsed = now - last_tick_ms_; last_tick_ms_ = now; if (gpio_->stop_active() && state_ != DeviceState::STOPPED) { motor_->emergency_stop_isr(); set_auto_enabled(false); state_ = DeviceState::STOPPED; error_ = ErrorCode::StopActive; return; } if (is_measurement()) { evaluate_measurement_needle(now); if (!is_measurement()) return; } motor_->ramp_tick(elapsed); if (is_approach()) { if (gpio_->contact_active()) { if (is_measurement() && !gpio_->needle_present()) { fail(ErrorCode::NeedleNotFound); return; } handle_contact(); return; } if (motor_->limit_reached()) { fail(ErrorCode::MaxStepsReached); return; } if (now - operation_started_ms_ >= (is_measurement() ? motion_config::MEASUREMENT_TIMEOUT_MS : motion_config::CALIBRATION_TIMEOUT_MS)) { fail(is_measurement() ? ErrorCode::MeasurementTimeout : ErrorCode::CalibrationTimeout); return; } } else if (is_retract()) { tick_retract(now); return; } tick_auto(now); if (auto_mode_enabled_) return; const bool left = gpio_->left_pressed(); if (state_ == DeviceState::IDLE && left) start_motion(DeviceState::MANUAL_LEFT, !config_.measure_dir_inverted, motion_config::JOG_SPEED_STEPS_S, UINT32_MAX, false); if (state_ == DeviceState::MANUAL_LEFT && !left) { safe_stop(); state_ = DeviceState::IDLE; } if (state_ == DeviceState::FINISHED) state_ = DeviceState::IDLE; }

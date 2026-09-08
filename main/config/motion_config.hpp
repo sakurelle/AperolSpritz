@@ -7,7 +7,7 @@
 namespace motion_config {
 // Preliminary value derived from 172.000 mm reference, 179.740 mm known
 // needle, and 162.401 mm old reported result. Verify with more samples.
-constexpr double MM_PER_STEP = 0.000242;
+constexpr double MM_PER_STEP = 0.0003127;
 constexpr uint32_t COARSE_SPEED_STEPS_S = 1500;
 constexpr uint32_t FINE_SPEED_STEPS_S = 500;
 constexpr uint32_t RETRACT_SPEED_STEPS_S = 1500;

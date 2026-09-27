@@ -7,6 +7,7 @@
 #include "freertos/semphr.h"
 
 class ConfigStorage;
+class IndicatorManager;
 class StepperMotor;
 
 enum class DeviceState : uint8_t {
@@ -43,7 +44,7 @@ enum class ErrorCode : uint8_t {
     InternalError,
 };
 
-enum class CommandType : uint8_t { Measure, Calibrate, AutoStart, AutoStop, ResetStop, ResetError, FactoryReset };
+enum class CommandType : uint8_t { Measure, Calibrate, AutoStart, AutoStop, Stop, ResetStop, ResetError, FactoryReset };
 struct ControllerCommand { CommandType type; };
 
 struct StatusSnapshot {
@@ -63,7 +64,7 @@ struct StatusSnapshot {
 
 class MeasurementController {
 public:
-    esp_err_t init(StepperMotor *, GpioManager *, ConfigStorage *, DeviceConfig, DeviceStats);
+    esp_err_t init(StepperMotor *, GpioManager *, ConfigStorage *, IndicatorManager *, DeviceConfig, DeviceStats);
     esp_err_t start_task();
     bool enqueue(CommandType);
     bool update_config(const DeviceConfig &, const char **);
@@ -88,18 +89,24 @@ private:
     void start_auto_load_position();
     void enter_auto_wait_sensor_clear();
     void tick_auto(uint32_t now);
+    void begin_contact_candidate(uint32_t now);
+    bool tick_contact_candidate(uint32_t now);
+    void check_motion_stall(uint32_t now);
     void set_auto_enabled(bool enabled);
     void fail(ErrorCode);
     void safe_stop();
     bool debounced(uint32_t now, uint32_t &last) const;
     bool is_approach() const;
     bool is_measurement() const;
+    bool needle_required_for_measurement() const;
     bool is_retract() const;
+    bool is_motion_state() const;
     bool needle_level_stable(bool expected_present, uint32_t now, uint32_t &since_ms) const;
 
     StepperMotor *motor_ = nullptr;
     GpioManager *gpio_ = nullptr;
     ConfigStorage *storage_ = nullptr;
+    IndicatorManager *indicator_ = nullptr;
     QueueHandle_t gpio_queue_ = nullptr;
     QueueHandle_t command_queue_ = nullptr;
     SemaphoreHandle_t mutex_ = nullptr;
@@ -118,6 +125,10 @@ private:
     int64_t retract_contact_position_steps_ = 0;
     int64_t retract_target_position_steps_ = 0;
     bool measurement_result_pending_ = false;
+    bool contact_candidate_ = false;
+    uint32_t contact_candidate_since_ms_ = 0;
+    uint32_t last_motion_progress_steps_ = 0;
+    uint32_t last_motion_progress_ms_ = 0;
     DeviceStats pending_measurement_stats_{};
     bool auto_mode_enabled_ = false;
     bool operation_auto_ = false;

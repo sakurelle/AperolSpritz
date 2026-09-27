@@ -12,7 +12,7 @@ constexpr uint32_t MIN_START_SPEED_STEPS_S = 200;
 
 bool IRAM_ATTR StepperMotor::on_alarm(gptimer_handle_t, const gptimer_alarm_event_data_t *, void *arg) {
     auto *self = static_cast<StepperMotor *>(arg);
-    if (!self->running_ || self->abort_requested_ || self->limit_reached_) {
+    if (!self->running_ || self->abort_requested_ || self->contact_abort_requested_ || self->limit_reached_) {
         gpio_set_level(STEP_PIN, 0);
         return false;
     }
@@ -82,6 +82,7 @@ esp_err_t StepperMotor::start(bool direction_positive, uint32_t target_speed_ste
     pulse_high_ = false;
     limit_reached_ = false;
     abort_requested_ = false;
+    contact_abort_requested_ = false;
     stop_on_contact_ = stop_on_contact;
     direction_positive_ = direction_positive;
     gpio_set_level(STEP_PIN, 0);
@@ -115,6 +116,7 @@ void StepperMotor::ramp_tick(uint32_t elapsed_ms) {
 void StepperMotor::stop() {
     running_ = false;
     stop_on_contact_ = false;
+    contact_abort_requested_ = false;
     if (timer_ && timer_started_) {
         gptimer_stop(timer_);
         timer_started_ = false;
@@ -127,6 +129,7 @@ void StepperMotor::stop() {
 void IRAM_ATTR StepperMotor::emergency_stop_isr() {
     stop_latched_ = true;
     abort_requested_ = true;
+    contact_abort_requested_ = false;
     running_ = false;
     stop_on_contact_ = false;
     gpio_set_level(STEP_PIN, 0);
@@ -135,14 +138,26 @@ void IRAM_ATTR StepperMotor::emergency_stop_isr() {
 }
 
 void IRAM_ATTR StepperMotor::request_stop_isr() {
+    abort_requested_ = true;
+    gpio_set_level(STEP_PIN, 0);
+}
+
+void IRAM_ATTR StepperMotor::request_contact_abort_isr() {
     if (stop_on_contact_) {
-        abort_requested_ = true;
+        contact_abort_requested_ = true;
         gpio_set_level(STEP_PIN, 0);
     }
 }
 
+bool StepperMotor::clear_contact_abort() {
+    if (stop_latched_ || abort_requested_ || limit_reached_) return false;
+    contact_abort_requested_ = false;
+    return true;
+}
+
 void StepperMotor::clear_abort() {
     abort_requested_ = false;
+    contact_abort_requested_ = false;
     limit_reached_ = false;
 }
 

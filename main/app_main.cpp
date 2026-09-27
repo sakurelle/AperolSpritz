@@ -3,6 +3,7 @@
 #include "config/pins.hpp"
 #include "config/config_storage.hpp"
 #include "gpio/gpio_manager.hpp"
+#include "indication/indicator_manager.hpp"
 #include "motor/stepper_motor.hpp"
 #include "measurement/measurement_controller.hpp"
 #include "wifi/wifi_manager.hpp"
@@ -13,6 +14,7 @@ static const char *TAG = "app";
 static ConfigStorage storage;
 static StepperMotor motor;
 static GpioManager gpio;
+static IndicatorManager indicator;
 static MeasurementController controller;
 static WifiManager wifi;
 static WebServer web;
@@ -26,6 +28,7 @@ extern "C" void app_main(void) {
     ESP_ERROR_CHECK(gpio_set_level(STEP_PIN, 0));
     ESP_ERROR_CHECK(gpio_set_level(DIR_PIN, 0));
     ESP_ERROR_CHECK(gpio_set_level(EN_PIN, 1)); // TMC2209 EN is active LOW
+    if (indicator.init() != ESP_OK) { ESP_LOGE(TAG, "Indicator initialization failed"); return; }
 
     if (storage.init() != ESP_OK) { ESP_LOGE(TAG, "NVS initialization failed; motor remains disabled"); return; }
     DeviceConfig config; DeviceStats stats; bool defaults = false;
@@ -33,7 +36,7 @@ extern "C" void app_main(void) {
     if (defaults) { ESP_LOGW(TAG, "Using factory defaults"); storage.save_config(config); storage.save_stats(stats); }
 
     if (motor.init() != ESP_OK) { ESP_LOGE(TAG, "Motor initialization failed"); return; }
-    if (controller.init(&motor, &gpio, &storage, config, stats) != ESP_OK) { ESP_LOGE(TAG, "GPIO/controller initialization failed"); motor.stop(); return; }
+    if (controller.init(&motor, &gpio, &storage, &indicator, config, stats) != ESP_OK) { ESP_LOGE(TAG, "GPIO/controller initialization failed"); motor.stop(); return; }
     if (controller.start_task() != ESP_OK) { ESP_LOGE(TAG, "Controller task initialization failed"); motor.stop(); return; }
 
     if (wifi.start() != ESP_OK) ESP_LOGE(TAG, "Wi-Fi unavailable; physical controls remain active");

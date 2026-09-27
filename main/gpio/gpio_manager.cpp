@@ -33,7 +33,7 @@ void IRAM_ATTR GpioManager::gpio_isr(void *arg) {
     GpioEventType type = GpioEventType::LeftChanged;
     if (ctx->pin == STOP_PIN) { type = GpioEventType::StopActive; if (low) self->motor_->emergency_stop_isr(); }
     else if (ctx->pin == NEEDLE_PIN) type = GpioEventType::NeedleChanged;
-    else if (ctx->pin == CONTACT_PIN) { type = GpioEventType::ContactActive; if (low) self->motor_->request_stop_isr(); }
+    else if (ctx->pin == CONTACT_PIN) { type = GpioEventType::ContactActive; if (low) self->motor_->request_contact_abort_isr(); }
     else if (ctx->pin == LEFT_PIN) { type = GpioEventType::LeftChanged; if (!low) self->motor_->request_stop_isr(); }
     else if (ctx->pin == MEASURE_PIN) type = GpioEventType::MeasurePressed;
     else if (ctx->pin == CALIBRATE_PIN) type = GpioEventType::CalibratePressed;

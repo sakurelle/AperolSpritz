@@ -13,11 +13,15 @@ public:
     void stop();
     void emergency_stop_isr();
     void request_stop_isr();
+    void request_contact_abort_isr();
+    bool clear_contact_abort();
     void ramp_tick(uint32_t elapsed_ms);
     void clear_abort();
     void clear_stop_latch();
     bool is_running() const { return running_; }
     bool abort_requested() const { return abort_requested_; }
+    bool contact_abort_requested() const { return contact_abort_requested_; }
+    bool can_generate_steps() const { return running_ && !abort_requested_ && !contact_abort_requested_ && !limit_reached_; }
     bool limit_reached() const { return limit_reached_; }
     bool is_enabled() const { return enabled_; }
     bool stop_latched() const { return stop_latched_; }
@@ -33,6 +37,7 @@ private:
     volatile bool timer_started_ = false;
     volatile bool enabled_ = false;
     volatile bool abort_requested_ = false;
+    volatile bool contact_abort_requested_ = false;
     volatile bool stop_latched_ = false;
     volatile bool pulse_high_ = false;
     volatile bool limit_reached_ = false;

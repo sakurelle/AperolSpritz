@@ -25,6 +25,7 @@ enum class DeviceState : uint8_t {
     AUTO_WAIT_REMOVE,
     AUTO_MOVE_TO_LOAD,
     MANUAL_LEFT,
+    SERVICE_MOVE,
     FINISHED,
     STOPPED,
     ERROR,
@@ -44,8 +45,8 @@ enum class ErrorCode : uint8_t {
     InternalError,
 };
 
-enum class CommandType : uint8_t { Measure, Calibrate, AutoStart, AutoStop, Stop, ResetStop, ResetError, FactoryReset };
-struct ControllerCommand { CommandType type; };
+enum class CommandType : uint8_t { Measure, Calibrate, AutoStart, AutoStop, Stop, ResetStop, ResetError, FactoryReset, ServiceMove };
+struct ControllerCommand { CommandType type; double value_mm = 0.0; };
 
 struct StatusSnapshot {
     DeviceState state;
@@ -60,6 +61,8 @@ struct StatusSnapshot {
     int64_t position_steps;
     DeviceStats stats;
     DeviceConfig config;
+    double service_move_requested_mm;
+    uint32_t service_move_target_steps;
 };
 
 class MeasurementController {
@@ -67,6 +70,7 @@ public:
     esp_err_t init(StepperMotor *, GpioManager *, ConfigStorage *, IndicatorManager *, DeviceConfig, DeviceStats);
     esp_err_t start_task();
     bool enqueue(CommandType);
+    bool enqueue_service_move(double distance_mm, const char **reason = nullptr);
     bool update_config(const DeviceConfig &, const char **);
     bool snapshot(StatusSnapshot &);
     double calculate_length(int64_t measurement_position_steps) const;
@@ -78,6 +82,7 @@ private:
     void process_command(const ControllerCommand &);
     void tick();
     void start_operation(bool calibration, bool automatic = false);
+    void start_service_move(double distance_mm);
     bool start_motion(DeviceState state, bool direction_positive, uint32_t speed, uint32_t max_steps, bool stop_on_contact);
     void handle_contact();
     void start_retract(bool final_retract);
@@ -101,6 +106,7 @@ private:
     bool needle_required_for_measurement() const;
     bool is_retract() const;
     bool is_motion_state() const;
+    bool service_move_allowed(double distance_mm, const char **reason) const;
     bool needle_level_stable(bool expected_present, uint32_t now, uint32_t &since_ms) const;
 
     StepperMotor *motor_ = nullptr;
@@ -137,6 +143,8 @@ private:
     uint32_t needle_absent_since_ms_ = 0;
     uint32_t sensor_clear_since_ms_ = 0;
     uint32_t auto_load_steps_ = 0;
+    double service_move_requested_mm_ = 0.0;
+    uint32_t service_move_target_steps_ = 0;
 };
 
 const char *state_name(DeviceState);

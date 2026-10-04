@@ -1,5 +1,6 @@
 #include "web/web_server.hpp"
 
+#include "config/motion_config.hpp"
 #include "measurement/measurement_controller.hpp"
 #include "wifi/wifi_manager.hpp"
 #include "esp_http_server.h"
@@ -35,7 +36,8 @@ const char PAGE[] = R"HTML(
     .message{min-height:0;margin:14px 0 0;padding:0;border-radius:10px;color:var(--red);font-weight:650}.message:not(:empty){padding:10px 13px;background:#fdf0f1}.message.info{color:var(--green);background:#eff9f2}
     .middle{display:grid;grid-template-columns:230px minmax(0,1fr);gap:16px;margin-top:16px}.emergency{display:grid;align-content:start;gap:10px}.emergency .btn{padding:15px}.system-grid{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:10px 24px;margin:0}.system-grid dt{color:var(--muted)}.system-grid dd{margin:0;font-weight:650;overflow-wrap:anywhere}.value-alert{color:var(--red)}.value-ok{color:var(--green)}
     .settings{margin-top:16px}.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px 20px}.field{display:grid;grid-template-columns:minmax(0,1fr) 146px;align-items:center;gap:12px}.field label{font-weight:600}.input-wrap{display:flex;align-items:center;border:1px solid #cbd4df;border-radius:9px;background:#fff;overflow:hidden}.input-wrap input{min-width:0;width:100%;border:0;outline:0;padding:10px 10px;font:inherit;text-align:right}.unit{padding-right:10px;color:var(--muted);font-size:14px}.check-field{display:flex;align-items:center;gap:10px;padding:10px 0}.check-field input{width:18px;height:18px;accent-color:var(--blue)}.settings-actions{margin-top:21px;display:flex;justify-content:flex-end}.settings-actions .btn{width:auto;min-width:210px}
-    @media(max-width:760px){.app{padding:20px 14px 32px}.topbar{align-items:flex-start;gap:12px;flex-direction:column}.hero,.middle{grid-template-columns:1fr}.indicator-card{min-height:28px;padding:0}.indicator{min-height:28px;height:28px;width:100%;border-radius:8px}.result-card{min-height:0}.settings-grid{grid-template-columns:1fr}.field{grid-template-columns:minmax(0,1fr) 140px}}
+    .service{margin-top:16px}.service-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px 28px}.service-values{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:8px 18px;margin:0}.service-values dt{color:var(--muted)}.service-values dd{margin:0;font-weight:650;overflow-wrap:anywhere}.service-actions{display:flex;gap:10px;align-items:end}.service-actions .btn{width:auto;min-width:156px}.service-result{margin-top:20px;padding-top:18px;border-top:1px solid var(--line)}.service-result-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 28px}.service-result-grid span{color:var(--muted)}.service-result-grid b{display:block;font-size:18px;color:var(--text)}.service-note{margin:14px 0 0;color:var(--muted);font-size:14px}
+    @media(max-width:760px){.app{padding:20px 14px 32px}.topbar{align-items:flex-start;gap:12px;flex-direction:column}.hero,.middle,.service-grid{grid-template-columns:1fr}.indicator-card{min-height:28px;padding:0}.indicator{min-height:28px;height:28px;width:100%;border-radius:8px}.result-card{min-height:0}.settings-grid{grid-template-columns:1fr}.field{grid-template-columns:minmax(0,1fr) 140px}.service-actions{align-items:stretch;flex-direction:column}.service-actions .btn{width:100%}.service-result-grid{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
@@ -110,11 +112,44 @@ const char PAGE[] = R"HTML(
         <div class="settings-actions"><button class="btn btn-primary" type="submit">Сохранить настройки</button></div>
       </form>
     </section>
+
+    <section class="card service" aria-label="Калибровка перемещения">
+      <h2>Калибровка перемещения</h2>
+      <p class="caption">Сервисный раздел. Перед движением убедитесь, что каретке доступен свободный ход.</p>
+      <div class="service-grid">
+        <dl class="service-values">
+          <dt>Текущий коэффициент</dt><dd id="service-current-mm-per-step">—</dd>
+          <dt>Шагов на мм</dt><dd id="service-current-steps-per-mm">—</dd>
+          <dt>Последняя команда</dt><dd id="service-last-command">—</dd>
+        </dl>
+        <form id="service-move-form">
+          <div class="field"><label for="service-distance-mm">Заданное перемещение</label><div class="input-wrap"><input id="service-distance-mm" type="number" step="0.001" required value="-100.000"><span class="unit">мм</span></div></div>
+          <div class="settings-actions"><button id="service-move" class="btn btn-secondary" type="submit">Переместить</button></div>
+        </form>
+      </div>
+      <div class="service-result">
+        <div class="service-grid">
+          <div class="field"><label for="service-actual-distance-mm">Фактическое перемещение</label><div class="input-wrap"><input id="service-actual-distance-mm" type="number" step="0.001" min="0" required placeholder="99.720"><span class="unit">мм</span></div></div>
+          <div class="service-actions"><button id="service-calculate" class="btn btn-secondary" type="button">Рассчитать</button><button id="service-apply" class="btn btn-primary" type="button" disabled>Применить коэффициент</button></div>
+        </div>
+        <div class="service-result-grid">
+          <div><span>Ожидалось</span><b id="service-expected">—</b></div>
+          <div><span>Фактически</span><b id="service-actual">—</b></div>
+          <div><span>Ошибка</span><b id="service-error-mm">—</b></div>
+          <div><span>Ошибка, %</span><b id="service-error-percent">—</b></div>
+          <div><span>Рекомендуемый коэффициент</span><b id="service-recommended-mm-per-step">—</b></div>
+          <div><span>Рекомендуемые шаги на мм</span><b id="service-recommended-steps-per-mm">—</b></div>
+        </div>
+        <p class="service-note">Отрицательное значение — влево, положительное — вправо. Фактическое перемещение вводится всегда положительным числом.</p>
+      </div>
+    </section>
   </main>
   <script>
-    const phaseNames={IDLE:'Ожидание',MEASURE_FAST:'Быстрый проход',MEASURE_RETRACT:'Отъезд',MEASURE_FINE:'Точное измерение',MEASURE_FINAL_RETRACT:'Финальный отъезд',CALIBRATE_FAST:'Калибровка: быстрый проход',CALIBRATE_RETRACT:'Калибровка: отъезд',CALIBRATE_FINE:'Калибровка: точное касание',CALIBRATE_FINAL_RETRACT:'Калибровка: финальный отъезд',AUTO_WAIT_SENSOR_CLEAR:'Ожидание освобождения датчика',AUTO_WAIT_NEEDLE:'Ожидание иглы',AUTO_WAIT_REMOVE:'Ожидание снятия иглы',AUTO_MOVE_TO_LOAD:'Возврат в загрузочную позицию',MANUAL_LEFT:'Ручное перемещение',FINISHED:'Операция завершена',STOPPED:'STOP',ERROR:'Ошибка'};
+    const phaseNames={IDLE:'Ожидание',MEASURE_FAST:'Быстрый проход',MEASURE_RETRACT:'Отъезд',MEASURE_FINE:'Точное измерение',MEASURE_FINAL_RETRACT:'Финальный отъезд',CALIBRATE_FAST:'Калибровка: быстрый проход',CALIBRATE_RETRACT:'Калибровка: отъезд',CALIBRATE_FINE:'Калибровка: точное касание',CALIBRATE_FINAL_RETRACT:'Калибровка: финальный отъезд',AUTO_WAIT_SENSOR_CLEAR:'Ожидание освобождения датчика',AUTO_WAIT_NEEDLE:'Ожидание иглы',AUTO_WAIT_REMOVE:'Ожидание снятия иглы',AUTO_MOVE_TO_LOAD:'Возврат в загрузочную позицию',MANUAL_LEFT:'Ручное перемещение',SERVICE_MOVE:'Сервисное перемещение',FINISHED:'Операция завершена',STOPPED:'STOP',ERROR:'Ошибка'};
     const errorNames={NONE:'Нет',NEEDLE_NOT_FOUND:'Игла не обнаружена',CONTACT_ALREADY_ACTIVE:'CONTACT уже активен',CONTACT_RELEASE_TIMEOUT:'CONTACT не освободился вовремя',MEASUREMENT_TIMEOUT:'Тайм-аут измерения',CALIBRATION_TIMEOUT:'Тайм-аут калибровки',MAX_STEPS_REACHED:'Достигнут лимит шагов',NOT_CALIBRATED:'Нет калибровки',STOP_ACTIVE:'Активен STOP',INVALID_CONFIG:'Некорректные настройки',INTERNAL_ERROR:'Внутренняя ошибка'};
     let currentStatus=null;
+    let lastServiceCommandMm=0;
+    let recommendedMmPerStep=null;
     const byId=id=>document.getElementById(id);
     const number=(value,digits=3)=>Number(value).toFixed(digits);
     const mm=(value,digits=3)=>`${number(value,digits)} мм`;
@@ -131,6 +166,33 @@ const char PAGE[] = R"HTML(
       return {color:'green',label:'В допуске'};
     }
     function isBusy(state){return !['IDLE','FINISHED','ERROR','STOPPED'].includes(state);}
+    function setServiceSummary(status){
+      const coefficient=Number(status.mm_per_step);
+      setText('service-current-mm-per-step',Number.isFinite(coefficient)&&coefficient>0?`${number(coefficient,9)} мм/шаг`:'—');
+      setText('service-current-steps-per-mm',Number.isFinite(coefficient)&&coefficient>0?`${number(1/coefficient,3)} шаг/мм`:'—');
+      const reportedCommand=Number(status.service_move_requested_mm);
+      if(Number.isFinite(reportedCommand)&&reportedCommand!==0)lastServiceCommandMm=reportedCommand;
+      setText('service-last-command',lastServiceCommandMm?signedMm(lastServiceCommandMm):'—');
+    }
+    function clearServiceCalculation(){
+      recommendedMmPerStep=null;
+      for(const id of ['service-expected','service-actual','service-error-mm','service-error-percent','service-recommended-mm-per-step','service-recommended-steps-per-mm'])setText(id,'—');
+      byId('service-apply').disabled=true;
+    }
+    function calculateServiceCoefficient(){
+      const actual=Number(byId('service-actual-distance-mm').value);
+      const expected=Math.abs(lastServiceCommandMm);
+      const coefficient=currentStatus&&Number(currentStatus.mm_per_step);
+      if(!Number.isFinite(expected)||expected<=0){showMessage('Сначала выполните сервисное перемещение.',true);return;}
+      if(!Number.isFinite(actual)||actual<=0){showMessage('Введите положительное фактическое перемещение.',true);return;}
+      if(!Number.isFinite(coefficient)||coefficient<=0){showMessage('Текущий коэффициент недоступен.',true);return;}
+      const error=actual-expected;
+      recommendedMmPerStep=coefficient*actual/expected;
+      setText('service-expected',mm(expected));setText('service-actual',mm(actual));setText('service-error-mm',signedMm(error));setText('service-error-percent',`${error>=0?'+':''}${number(error/expected*100,3)} %`);
+      setText('service-recommended-mm-per-step',`${number(recommendedMmPerStep,9)} мм/шаг`);
+      setText('service-recommended-steps-per-mm',`${number(1/recommendedMmPerStep,3)} шаг/мм`);
+      byId('service-apply').disabled=false;
+    }
     function put(status){
       currentStatus=status;
       const hasMeasurement=status.result&&status.result!=='NONE';
@@ -149,9 +211,12 @@ const char PAGE[] = R"HTML(
       setText('calibration-source',status.calibration_source==='AUTO'?'Автоматическая':status.calibration_source==='MANUAL'?'Ручная':'Нет калибровки');
       setText('calibration-reference',status.calibration_valid?mm(status.calibration_reference_length_mm):'Нет калибровки');
       setText('measurements-since-calibration',String(status.measurements_since_calibration??0));
+      setServiceSummary(status);
       const busy=isBusy(status.state);byId('measure').disabled=busy||status.auto_mode_enabled;byId('calibrate').disabled=busy||status.auto_mode_enabled;
       const auto=byId('auto');auto.textContent=`Авто: ${status.auto_mode_enabled?'ВКЛ':'ВЫКЛ'}`;auto.className=`btn ${status.auto_mode_enabled?'btn-auto-on':'btn-secondary'}`;auto.disabled=busy;
       byId('reset-stop').disabled=status.state!=='STOPPED';byId('reset-error').disabled=status.state!=='ERROR';
+      byId('service-move').disabled=busy||status.auto_mode_enabled||stopActive||error!=='NONE';
+      if(recommendedMmPerStep===null)byId('service-apply').disabled=true;
       setText('operation',busy?(phaseNames[status.state]||status.state):status.auto_mode_enabled?(status.auto_phase||'Автоматический режим'):'Ожидание команды');
       setText('connection','Устройство на связи');
       if(stopActive)showMessage('STOP активен. После устранения причины нажмите «Сброс STOP».',true);else if(error!=='NONE')showMessage(errorNames[error]||error,true);
@@ -160,6 +225,26 @@ const char PAGE[] = R"HTML(
     async function refreshStatus(){try{const response=await fetch('/api/status');if(!response.ok)throw new Error();put(await response.json());}catch(_){setText('connection','Нет связи с устройством');showMessage('Не удалось получить состояние устройства.',true);}}
     async function loadConfig(){try{const response=await fetch('/api/config');if(!response.ok)throw new Error();const config=await response.json();for(const key of ['nominal_length_mm','tolerance_mm','calibration_length_mm','auto_calibration_length_mm','retract_mm'])byId(key).value=config[key];byId('measure_dir_inverted').checked=Boolean(config.measure_dir_inverted);}catch(_){showMessage('Не удалось загрузить настройки.',true);}}
     async function saveConfig(event){event.preventDefault();const config={};for(const key of ['nominal_length_mm','tolerance_mm','calibration_length_mm','auto_calibration_length_mm','retract_mm'])config[key]=Number(byId(key).value);config.measure_dir_inverted=byId('measure_dir_inverted').checked;try{const response=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)});if(!response.ok)throw new Error(await response.text()||'Настройки отклонены');showMessage('Настройки сохранены');await refreshStatus();}catch(error){showMessage(error.message||'Не удалось сохранить настройки.',true);}}
+    async function serviceMove(event){
+      event.preventDefault();
+      const distanceMm=Number(byId('service-distance-mm').value);
+      if(!Number.isFinite(distanceMm)||distanceMm===0||Math.abs(distanceMm)>150){showMessage('Введите ненулевое перемещение не более 150 мм.',true);return;}
+      try{
+        const response=await fetch('/api/service-move',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({distance_mm:distanceMm})});
+        if(!response.ok)throw new Error(await response.text()||'Сервисное перемещение отклонено');
+        lastServiceCommandMm=distanceMm;clearServiceCalculation();showMessage('Сервисное перемещение принято');await refreshStatus();
+      }catch(error){showMessage(error.message||'Не удалось запустить сервисное перемещение.',true);}
+    }
+    async function applyServiceCoefficient(){
+      if(!currentStatus||!Number.isFinite(recommendedMmPerStep)||recommendedMmPerStep<=0){showMessage('Сначала рассчитайте коэффициент.',true);return;}
+      const current=Number(currentStatus.mm_per_step);
+      if(!window.confirm(`Изменить MM_PER_STEP с\n${number(current,9)}\nна\n${number(recommendedMmPerStep,9)}?\n\nПосле изменения необходимо выполнить новую калибровку.`))return;
+      try{
+        const response=await fetch('/api/service/mm-per-step',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mm_per_step:recommendedMmPerStep})});
+        if(!response.ok)throw new Error(await response.text()||'Коэффициент отклонён');
+        recommendedMmPerStep=null;showMessage('Коэффициент сохранён. Выполните калибровку устройства.');await refreshStatus();
+      }catch(error){showMessage(error.message||'Не удалось сохранить коэффициент.',true);}
+    }
     byId('measure').addEventListener('click',()=>request('measure').catch(error=>showMessage(error.message,true)));
     byId('calibrate').addEventListener('click',()=>request('calibrate').catch(error=>showMessage(error.message,true)));
     byId('auto').addEventListener('click',()=>request(currentStatus&&currentStatus.auto_mode_enabled?'auto/stop':'auto/start').catch(error=>showMessage(error.message,true)));
@@ -167,6 +252,9 @@ const char PAGE[] = R"HTML(
     byId('reset-stop').addEventListener('click',()=>request('reset-stop').catch(error=>showMessage(error.message,true)));
     byId('reset-error').addEventListener('click',()=>request('reset-error').catch(error=>showMessage(error.message,true)));
     byId('config-form').addEventListener('submit',saveConfig);
+    byId('service-move-form').addEventListener('submit',serviceMove);
+    byId('service-calculate').addEventListener('click',calculateServiceCoefficient);
+    byId('service-apply').addEventListener('click',applyServiceCoefficient);
     loadConfig();refreshStatus();setInterval(refreshStatus,700);
   </script>
 </body>
@@ -178,6 +266,12 @@ WebContext *context(httpd_req_t *request) { return static_cast<WebContext *>(req
 esp_err_t json(httpd_req_t *request, const char *body) {
     httpd_resp_set_type(request, HTTPD_TYPE_JSON);
     return httpd_resp_sendstr(request, body);
+}
+
+esp_err_t conflict(httpd_req_t *request, const char *message) {
+    httpd_resp_set_status(request, "409 Conflict");
+    httpd_resp_set_type(request, HTTPD_TYPE_TEXT);
+    return httpd_resp_sendstr(request, message);
 }
 
 esp_err_t root(httpd_req_t *request) {
@@ -200,8 +294,8 @@ esp_err_t status(httpd_req_t *request) {
     if (!snapshot(request, measurement, wifi)) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Controller unavailable");
     char body[2200];
     const int length = std::snprintf(body, sizeof(body),
-        "{\"state\":\"%s\",\"error\":\"%s\",\"needle_present\":%s,\"contact\":%s,\"stop_active\":%s,\"motor_enabled\":%s,\"auto_mode_enabled\":%s,\"auto_phase\":\"%s\",\"current_speed_steps_s\":%lu,\"position_steps\":%lld,\"last_length_mm\":%.6f,\"nominal_length_mm\":%.6f,\"deviation_mm\":%.6f,\"tolerance_mm\":%.6f,\"result\":\"%s\",\"calibration_valid\":%s,\"calibration_source\":\"%s\",\"calibration_reference_length_mm\":%.6f,\"measurements_since_calibration\":%lu,\"wifi_mode\":\"%s\",\"wifi_connected\":%s,\"ip_address\":\"%s\"}",
-        state_name(measurement.state), error_name(measurement.error), measurement.needle_present ? "true" : "false", measurement.contact ? "true" : "false", measurement.stop_active ? "true" : "false", measurement.motor_enabled ? "true" : "false", measurement.auto_mode_enabled ? "true" : "false", measurement.auto_phase, static_cast<unsigned long>(measurement.current_speed_steps_s), static_cast<long long>(measurement.position_steps), measurement.stats.last_measured_length, measurement.config.nominal_length_mm, measurement.stats.last_deviation, measurement.config.tolerance_mm, measurement.stats.last_result, measurement.stats.calibration_valid ? "true" : "false", calibration_source_name(measurement.stats.calibration_source), measurement.stats.calibration_reference_length_mm, static_cast<unsigned long>(measurement.stats.measurements_since_calibration), wifi_mode_name(wifi.mode), wifi.connected ? "true" : "false", wifi.ip_address);
+        "{\"state\":\"%s\",\"error\":\"%s\",\"needle_present\":%s,\"contact\":%s,\"stop_active\":%s,\"motor_enabled\":%s,\"auto_mode_enabled\":%s,\"auto_phase\":\"%s\",\"current_speed_steps_s\":%lu,\"position_steps\":%lld,\"last_length_mm\":%.6f,\"nominal_length_mm\":%.6f,\"deviation_mm\":%.6f,\"tolerance_mm\":%.6f,\"result\":\"%s\",\"calibration_valid\":%s,\"calibration_source\":\"%s\",\"calibration_reference_length_mm\":%.6f,\"measurements_since_calibration\":%lu,\"mm_per_step\":%.9f,\"service_move_requested_mm\":%.6f,\"service_move_target_steps\":%lu,\"wifi_mode\":\"%s\",\"wifi_connected\":%s,\"ip_address\":\"%s\"}",
+        state_name(measurement.state), error_name(measurement.error), measurement.needle_present ? "true" : "false", measurement.contact ? "true" : "false", measurement.stop_active ? "true" : "false", measurement.motor_enabled ? "true" : "false", measurement.auto_mode_enabled ? "true" : "false", measurement.auto_phase, static_cast<unsigned long>(measurement.current_speed_steps_s), static_cast<long long>(measurement.position_steps), measurement.stats.last_measured_length, measurement.config.nominal_length_mm, measurement.stats.last_deviation, measurement.config.tolerance_mm, measurement.stats.last_result, measurement.stats.calibration_valid ? "true" : "false", calibration_source_name(measurement.stats.calibration_source), measurement.stats.calibration_reference_length_mm, static_cast<unsigned long>(measurement.stats.measurements_since_calibration), measurement.config.mm_per_step, measurement.service_move_requested_mm, static_cast<unsigned long>(measurement.service_move_target_steps), wifi_mode_name(wifi.mode), wifi.connected ? "true" : "false", wifi.ip_address);
     return length < 0 || static_cast<size_t>(length) >= sizeof(body) ? ESP_ERR_NO_MEM : json(request, body);
 }
 
@@ -210,7 +304,7 @@ esp_err_t get_config(httpd_req_t *request) {
     WifiStatus wifi{};
     if (!snapshot(request, measurement, wifi)) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Controller unavailable");
     char body[512];
-    const int length = std::snprintf(body, sizeof(body), "{\"nominal_length_mm\":%.6f,\"tolerance_mm\":%.6f,\"calibration_length_mm\":%.6f,\"auto_calibration_length_mm\":%.6f,\"retract_mm\":%.6f,\"measure_dir_inverted\":%s}", measurement.config.nominal_length_mm, measurement.config.tolerance_mm, measurement.config.calibration_length_mm, measurement.config.auto_calibration_length_mm, measurement.config.retract_mm, measurement.config.measure_dir_inverted ? "true" : "false");
+    const int length = std::snprintf(body, sizeof(body), "{\"nominal_length_mm\":%.6f,\"tolerance_mm\":%.6f,\"calibration_length_mm\":%.6f,\"auto_calibration_length_mm\":%.6f,\"retract_mm\":%.6f,\"measure_dir_inverted\":%s,\"mm_per_step\":%.9f}", measurement.config.nominal_length_mm, measurement.config.tolerance_mm, measurement.config.calibration_length_mm, measurement.config.auto_calibration_length_mm, measurement.config.retract_mm, measurement.config.measure_dir_inverted ? "true" : "false", measurement.config.mm_per_step);
     return length < 0 || static_cast<size_t>(length) >= sizeof(body) ? ESP_ERR_NO_MEM : json(request, body);
 }
 
@@ -272,11 +366,46 @@ esp_err_t post_config(httpd_req_t *request) {
     WifiStatus wifi{};
     if (!snapshot(request, measurement, wifi)) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Controller unavailable");
     DeviceConfig config = measurement.config;
-    const bool valid = optional_double(body, "nominal_length_mm", config.nominal_length_mm) && optional_double(body, "tolerance_mm", config.tolerance_mm) && optional_double(body, "calibration_length_mm", config.calibration_length_mm) && optional_double(body, "auto_calibration_length_mm", config.auto_calibration_length_mm) && optional_double(body, "retract_mm", config.retract_mm) && optional_bool(body, "measure_dir_inverted", config.measure_dir_inverted);
+    const bool valid = value(body, "mm_per_step") == nullptr && optional_double(body, "nominal_length_mm", config.nominal_length_mm) && optional_double(body, "tolerance_mm", config.tolerance_mm) && optional_double(body, "calibration_length_mm", config.calibration_length_mm) && optional_double(body, "auto_calibration_length_mm", config.auto_calibration_length_mm) && optional_double(body, "retract_mm", config.retract_mm) && optional_bool(body, "measure_dir_inverted", config.measure_dir_inverted);
     const char *reason = nullptr;
     auto *web = context(request);
     if (!valid || !web || !web->controller || !web->controller->update_config(config, &reason)) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, reason ? reason : "Settings rejected");
     return json(request, "{\"ok\":true}");
+}
+
+esp_err_t post_service_move(httpd_req_t *request) {
+    char body[256];
+    double distance_mm = 0.0;
+    if (!request_body(request, body, sizeof(body)) || !number(value(body, "distance_mm"), distance_mm) || distance_mm == 0.0 || std::fabs(distance_mm) > motion_config::MAX_SERVICE_MOVE_MM) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "distance_mm must be non-zero and no more than 150 mm");
+    auto *web = context(request);
+    if (!web || !web->controller) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Controller unavailable");
+    const char *reason = nullptr;
+    if (!web->controller->enqueue_service_move(distance_mm, &reason)) {
+        if (reason && (std::strcmp(reason, "Controller busy") == 0 || std::strcmp(reason, "Command queue full") == 0)) {
+            httpd_resp_set_status(request, "503 Service Unavailable");
+            return json(request, "{\"error\":\"Controller busy\"}");
+        }
+        return conflict(request, reason ? reason : "Service move unavailable");
+    }
+    return json(request, "{\"accepted\":true}");
+}
+
+esp_err_t post_service_mm_per_step(httpd_req_t *request) {
+    char body[256];
+    double mm_per_step = 0.0;
+    if (!request_body(request, body, sizeof(body)) || !number(value(body, "mm_per_step"), mm_per_step)) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid mm_per_step");
+    StatusSnapshot measurement{};
+    WifiStatus wifi{};
+    if (!snapshot(request, measurement, wifi)) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Controller unavailable");
+    DeviceConfig config = measurement.config;
+    config.mm_per_step = mm_per_step;
+    const char *reason = nullptr;
+    auto *web = context(request);
+    if (!web || !web->controller || !web->controller->update_config(config, &reason)) {
+        if (reason && std::strcmp(reason, "Settings can be changed only in IDLE") == 0) return conflict(request, reason);
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, reason ? reason : "mm_per_step rejected");
+    }
+    return json(request, "{\"ok\":true,\"calibration_invalidated\":true}");
 }
 
 esp_err_t command(httpd_req_t *request) {
@@ -297,7 +426,7 @@ esp_err_t WebServer::start(MeasurementController *controller, WifiManager *wifi)
     if (server_) return ESP_ERR_INVALID_STATE;
     context_ = {controller, wifi};
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 16;
     httpd_handle_t server = nullptr;
     esp_err_t error = httpd_start(&server, &config);
     if (error != ESP_OK) return error;
@@ -306,6 +435,8 @@ esp_err_t WebServer::start(MeasurementController *controller, WifiManager *wifi)
         {.uri = "/api/status", .method = HTTP_GET, .handler = status, .user_ctx = &context_},
         {.uri = "/api/config", .method = HTTP_GET, .handler = get_config, .user_ctx = &context_},
         {.uri = "/api/config", .method = HTTP_POST, .handler = post_config, .user_ctx = &context_},
+        {.uri = "/api/service-move", .method = HTTP_POST, .handler = post_service_move, .user_ctx = &context_},
+        {.uri = "/api/service/mm-per-step", .method = HTTP_POST, .handler = post_service_mm_per_step, .user_ctx = &context_},
         {.uri = "/api/measure", .method = HTTP_POST, .handler = command, .user_ctx = &context_},
         {.uri = "/api/calibrate", .method = HTTP_POST, .handler = command, .user_ctx = &context_},
         {.uri = "/api/auto/start", .method = HTTP_POST, .handler = command, .user_ctx = &context_},

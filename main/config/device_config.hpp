@@ -1,7 +1,9 @@
 #pragma once
+#include "config/motion_config.hpp"
+
 #include <stdint.h>
 
-constexpr uint32_t CONFIG_VERSION = 4;
+constexpr uint32_t CONFIG_VERSION = 5;
 
 struct DeviceConfig {
     uint32_t config_version = CONFIG_VERSION;
@@ -11,6 +13,7 @@ struct DeviceConfig {
     double tolerance_mm = 0.050;
     double retract_mm = 2.0;
     bool measure_dir_inverted = false;
+    double mm_per_step = motion_config::DEFAULT_MM_PER_STEP;
 };
 
 enum class CalibrationSource : uint8_t { None, Manual, Auto };

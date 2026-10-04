@@ -29,7 +29,7 @@ const char *state_name(DeviceState state) {
     case DeviceState::CALIBRATE_FAST: return "CALIBRATE_FAST"; case DeviceState::CALIBRATE_RETRACT: return "CALIBRATE_RETRACT";
     case DeviceState::CALIBRATE_FINE: return "CALIBRATE_FINE"; case DeviceState::CALIBRATE_FINAL_RETRACT: return "CALIBRATE_FINAL_RETRACT";
     case DeviceState::AUTO_WAIT_SENSOR_CLEAR: return "AUTO_WAIT_SENSOR_CLEAR"; case DeviceState::AUTO_WAIT_NEEDLE: return "AUTO_WAIT_NEEDLE"; case DeviceState::AUTO_WAIT_REMOVE: return "AUTO_WAIT_REMOVE"; case DeviceState::AUTO_MOVE_TO_LOAD: return "AUTO_MOVE_TO_LOAD";
-    case DeviceState::MANUAL_LEFT: return "MANUAL_LEFT"; case DeviceState::FINISHED: return "FINISHED"; case DeviceState::STOPPED: return "STOPPED"; case DeviceState::ERROR: return "ERROR";
+    case DeviceState::MANUAL_LEFT: return "MANUAL_LEFT"; case DeviceState::SERVICE_MOVE: return "SERVICE_MOVE"; case DeviceState::FINISHED: return "FINISHED"; case DeviceState::STOPPED: return "STOPPED"; case DeviceState::ERROR: return "ERROR";
     } return "ERROR";
 }
 const char *error_name(ErrorCode error) {
@@ -52,14 +52,34 @@ esp_err_t MeasurementController::start_task() { if (!gpio_queue_ || !command_que
 void MeasurementController::task_entry(void *context) { static_cast<MeasurementController *>(context)->run(); }
 bool MeasurementController::enqueue(CommandType type) { const ControllerCommand c{type}; return command_queue_ && xQueueSend(command_queue_, &c, 0) == pdTRUE; }
 
+bool MeasurementController::enqueue_service_move(double distance_mm, const char **reason) {
+    if (!mutex_ || !command_queue_) { if (reason) *reason = "Controller unavailable"; return false; }
+    if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(50)) != pdTRUE) { if (reason) *reason = "Controller busy"; return false; }
+    const bool allowed = service_move_allowed(distance_mm, reason);
+    const bool queue_empty = uxQueueMessagesWaiting(command_queue_) == 0;
+    if (allowed && !queue_empty && reason) *reason = "Controller command pending";
+    const ControllerCommand command{CommandType::ServiceMove, distance_mm};
+    const bool queued = allowed && queue_empty && xQueueSend(command_queue_, &command, 0) == pdTRUE;
+    if (allowed && queue_empty && !queued && reason) *reason = "Command queue full";
+    xSemaphoreGive(mutex_);
+    return queued;
+}
+
 bool MeasurementController::update_config(const DeviceConfig &config, const char **reason) {
     if (!validate_config(config, reason) || !mutex_) return false;
     if (xSemaphoreTake(mutex_, pdMS_TO_TICKS(50)) != pdTRUE) { if (reason) *reason = "Controller busy"; return false; }
     if (state_ != DeviceState::IDLE) { xSemaphoreGive(mutex_); if (reason) *reason = "Settings can be changed only in IDLE"; return false; }
-    const bool invalidate = std::fabs(config.calibration_length_mm - config_.calibration_length_mm) > 1e-12 || std::fabs(config.auto_calibration_length_mm - config_.auto_calibration_length_mm) > 1e-12 || config.measure_dir_inverted != config_.measure_dir_inverted;
-    config_ = config;
-    if (invalidate) { stats_.calibration_valid = false; stats_.calibration_source = CalibrationSource::None; stats_.calibration_reference_length_mm = 0; stats_.measurements_since_calibration = 0; }
-    esp_err_t err = storage_->save_config(config_); if (err == ESP_OK && invalidate) err = storage_->save_stats(stats_); xSemaphoreGive(mutex_);
+    const double old_mm_per_step = config_.mm_per_step;
+    const bool mm_per_step_changed = std::fabs(config.mm_per_step - old_mm_per_step) > 1e-12;
+    const bool invalidate = std::fabs(config.calibration_length_mm - config_.calibration_length_mm) > 1e-12 || std::fabs(config.auto_calibration_length_mm - config_.auto_calibration_length_mm) > 1e-12 || config.measure_dir_inverted != config_.measure_dir_inverted || mm_per_step_changed;
+    DeviceStats updated_stats = stats_;
+    if (invalidate) { updated_stats.calibration_valid = false; updated_stats.calibration_source = CalibrationSource::None; updated_stats.calibration_reference_length_mm = 0; updated_stats.measurements_since_calibration = 0; }
+    esp_err_t err = invalidate ? storage_->save_stats(updated_stats) : ESP_OK;
+    if (err == ESP_OK) err = storage_->save_config(config);
+    if (err == ESP_OK) { config_ = config; stats_ = updated_stats; }
+    else if (invalidate) stats_ = updated_stats; // A failed config write must never leave a stale calibration valid.
+    if (err == ESP_OK && mm_per_step_changed) ESP_LOGI(TAG, "MM_PER_STEP updated: old=%.9f new=%.9f calibration invalidated", old_mm_per_step, config.mm_per_step);
+    xSemaphoreGive(mutex_);
     if (err != ESP_OK && reason) *reason = "NVS write failed";
     return err == ESP_OK;
 }
@@ -67,12 +87,12 @@ bool MeasurementController::snapshot(StatusSnapshot &out) {
     if (!mutex_ || !gpio_ || !motor_) return false;
     xSemaphoreTake(mutex_, portMAX_DELAY);
     const char *phase = !auto_mode_enabled_ ? "ВЫКЛ" : state_ == DeviceState::AUTO_WAIT_SENSOR_CLEAR ? "Ожидание освобождения датчика" : state_ == DeviceState::AUTO_WAIT_NEEDLE ? "Ожидание иглы" : state_ == DeviceState::AUTO_WAIT_REMOVE ? "Ожидание снятия иглы" : state_ == DeviceState::AUTO_MOVE_TO_LOAD ? "Возврат в загрузочную позицию" : operation_auto_ && operation_calibration_ ? "Автокалибровка" : operation_auto_ ? "Автоматическое измерение" : "Готов";
-    out = {state_, error_, gpio_->needle_present(), gpio_->contact_active(), gpio_->stop_active(), motor_->is_enabled(), auto_mode_enabled_, phase, motor_->current_speed_steps_s(), motor_->position_steps(), stats_, config_}; xSemaphoreGive(mutex_); return true;
+    out = {state_, error_, gpio_->needle_present(), gpio_->contact_active(), gpio_->stop_active(), motor_->is_enabled(), auto_mode_enabled_, phase, motor_->current_speed_steps_s(), motor_->position_steps(), stats_, config_, service_move_requested_mm_, service_move_target_steps_}; xSemaphoreGive(mutex_); return true;
 }
 double MeasurementController::calculate_length(int64_t p) const {
     // StepperMotor adds one position step for a positive approach and subtracts
     // one for a negative approach. A longer object must always add to length.
-    return length_from_positions(stats_.calibration_reference_length_mm, stats_.calibration_contact_position_steps, p, config_.measure_dir_inverted, motion_config::MM_PER_STEP);
+    return length_from_positions(stats_.calibration_reference_length_mm, stats_.calibration_contact_position_steps, p, config_.measure_dir_inverted, config_.mm_per_step);
 }
 bool MeasurementController::debounced(uint32_t now, uint32_t &last) const { if (now - last < motion_config::NEEDLE_DEBOUNCE_MS) return false; last = now; return true; }
 bool MeasurementController::is_measurement() const { return state_ == DeviceState::MEASURE_FAST || state_ == DeviceState::MEASURE_RETRACT || state_ == DeviceState::MEASURE_FINE || state_ == DeviceState::MEASURE_FINAL_RETRACT; }
@@ -84,7 +104,7 @@ bool MeasurementController::needle_level_stable(bool expected_present, uint32_t 
 }
 bool MeasurementController::is_approach() const { return state_ == DeviceState::MEASURE_FAST || state_ == DeviceState::MEASURE_FINE || state_ == DeviceState::CALIBRATE_FAST || state_ == DeviceState::CALIBRATE_FINE; }
 bool MeasurementController::is_retract() const { return state_ == DeviceState::MEASURE_RETRACT || state_ == DeviceState::MEASURE_FINAL_RETRACT || state_ == DeviceState::CALIBRATE_RETRACT || state_ == DeviceState::CALIBRATE_FINAL_RETRACT; }
-bool MeasurementController::is_motion_state() const { return is_approach() || is_retract() || state_ == DeviceState::AUTO_MOVE_TO_LOAD || state_ == DeviceState::MANUAL_LEFT; }
+bool MeasurementController::is_motion_state() const { return is_approach() || is_retract() || state_ == DeviceState::AUTO_MOVE_TO_LOAD || state_ == DeviceState::MANUAL_LEFT || state_ == DeviceState::SERVICE_MOVE; }
 
 void MeasurementController::run() { last_tick_ms_ = now_ms(); ESP_LOGI(TAG, "Controller started"); for (;;) { GpioEvent e{}; ControllerCommand c{}; xSemaphoreTake(mutex_, portMAX_DELAY); while (xQueueReceive(gpio_queue_, &e, 0) == pdTRUE) process_gpio(e); while (xQueueReceive(command_queue_, &c, 0) == pdTRUE) process_command(c); tick(); indicator_->set_error(state_ == DeviceState::ERROR); indicator_->set_busy(is_motion_state()); indicator_->tick(now_ms()); xSemaphoreGive(mutex_); vTaskDelay(pdMS_TO_TICKS(1)); } }
 void MeasurementController::process_gpio(const GpioEvent &e) {
@@ -114,16 +134,48 @@ void MeasurementController::process_command(const ControllerCommand &c) {
     case CommandType::ResetStop: if (state_ == DeviceState::STOPPED && !gpio_->stop_active()) { motor_->clear_stop_latch(); motor_->clear_abort(); state_ = DeviceState::IDLE; error_ = ErrorCode::None; } break;
     case CommandType::ResetError: if (state_ == DeviceState::ERROR) { motor_->clear_abort(); state_ = DeviceState::IDLE; error_ = ErrorCode::None; } break;
     case CommandType::FactoryReset: if (state_ == DeviceState::IDLE && !auto_mode_enabled_) storage_->factory_reset(config_, stats_); break;
+    case CommandType::ServiceMove: start_service_move(c.value_mm); break;
     }
 }
 bool MeasurementController::start_motion(DeviceState s, bool pos, uint32_t speed, uint32_t max, bool contact) { motor_->clear_abort(); if (motor_->start(pos, speed, motion_config::ACCELERATION_STEPS_S2, max, motion_config::STEP_HIGH_US, contact) != ESP_OK) { fail(ErrorCode::InternalError); return false; } state_ = s; phase_started_ms_ = now_ms(); contact_candidate_ = false; last_motion_progress_steps_ = motor_->completed_steps(); last_motion_progress_ms_ = phase_started_ms_; return true; }
+
+bool MeasurementController::service_move_allowed(double distance_mm, const char **reason) const {
+    const char *error = nullptr;
+    const double magnitude = std::fabs(distance_mm);
+    if (!std::isfinite(distance_mm) || magnitude <= 0.0 || magnitude > motion_config::MAX_SERVICE_MOVE_MM) error = "Service distance must be greater than 0 and no more than 150 mm";
+    else if (motion_config::mm_to_steps(magnitude, config_.mm_per_step) == 0) error = "Service distance is smaller than one motor step";
+    else if (state_ != DeviceState::IDLE || error_ != ErrorCode::None || auto_mode_enabled_ || motor_->is_running() || motor_->is_enabled()) error = "Service move is available only in IDLE";
+    else if (gpio_->stop_active()) error = "STOP is active";
+    // Positive service movement uses the normal approach direction. With
+    // CONTACT already closed, only the established LEFT/JOG direction is safe.
+    else if (gpio_->contact_active() && distance_mm > 0.0) error = "CONTACT is active; only movement away from contact is allowed";
+    if (reason) *reason = error;
+    return error == nullptr;
+}
+
+void MeasurementController::start_service_move(double distance_mm) {
+    const char *reason = nullptr;
+    if (!service_move_allowed(distance_mm, &reason)) {
+        ESP_LOGW(TAG, "SERVICE MOVE rejected: %s", reason ? reason : "unavailable");
+        return;
+    }
+    const uint32_t target_steps = motion_config::mm_to_steps(std::fabs(distance_mm), config_.mm_per_step);
+    const bool direction_positive = distance_mm < 0.0 ? !config_.measure_dir_inverted : config_.measure_dir_inverted;
+    ESP_LOGI(TAG, "SERVICE MOVE: requested_mm=%.3f mm_per_step=%.9f target_steps=%lu direction=%s", distance_mm, config_.mm_per_step, static_cast<unsigned long>(target_steps), distance_mm < 0.0 ? "LEFT" : "RIGHT");
+    if (!start_motion(DeviceState::SERVICE_MOVE, direction_positive, motion_config::SERVICE_MOVE_SPEED_STEPS_S, target_steps, false)) return;
+    service_move_requested_mm_ = distance_mm;
+    service_move_target_steps_ = target_steps;
+}
+
 void MeasurementController::start_operation(bool cal, bool automatic) {
     if ((state_ != DeviceState::IDLE && state_ != DeviceState::FINISHED && !automatic) || gpio_->stop_active()) { if (gpio_->stop_active()) { safe_stop(); indicator_->stop_sound(); set_auto_enabled(false); state_ = DeviceState::STOPPED; error_ = ErrorCode::StopActive; } return; }
     if (!cal && (!gpio_->needle_present() || !stats_.calibration_valid)) { fail(!gpio_->needle_present() ? ErrorCode::NeedleNotFound : ErrorCode::NotCalibrated); return; }
     if (gpio_->contact_active()) { fail(ErrorCode::ContactAlreadyActive); return; }
     operation_auto_ = automatic; operation_calibration_ = cal; error_ = ErrorCode::None; optical_absence_started_ms_ = 0; measurement_result_pending_ = false; operation_started_ms_ = now_ms();
     ESP_LOGI(TAG, "%s", automatic ? (cal ? "AUTO: calibration started" : "AUTO: measurement started") : (cal ? "MANUAL: calibration started" : "MANUAL: measurement started"));
-    if (start_motion(cal ? DeviceState::CALIBRATE_FAST : DeviceState::MEASURE_FAST, config_.measure_dir_inverted, motion_config::COARSE_SPEED_STEPS_S, cal ? motion_config::MAX_CALIBRATION_STEPS : motion_config::MAX_MEASUREMENT_STEPS, true)) indicator_->beep_start();
+    const uint32_t max_steps = motion_config::mm_to_steps(cal ? motion_config::MAX_CALIBRATION_MM : motion_config::MAX_MEASUREMENT_MM, config_.mm_per_step);
+    if (!max_steps) { fail(ErrorCode::InvalidConfig); return; }
+    if (start_motion(cal ? DeviceState::CALIBRATE_FAST : DeviceState::MEASURE_FAST, config_.measure_dir_inverted, motion_config::COARSE_SPEED_STEPS_S, max_steps, true)) indicator_->beep_start();
 }
 void MeasurementController::handle_contact() {
     const DeviceState s = state_; const uint32_t steps = motor_->completed_steps();
@@ -137,9 +189,9 @@ void MeasurementController::handle_contact() {
         pending_measurement_stats_.last_measurement_contact_position_steps = motor_->position_steps();
         const int64_t delta_steps = stats_.calibration_contact_position_steps - pending_measurement_stats_.last_measurement_contact_position_steps;
         const double direction_sign = approach_direction_sign(config_.measure_dir_inverted);
-        const double delta_mm = direction_sign * static_cast<double>(delta_steps) * motion_config::MM_PER_STEP;
+        const double delta_mm = direction_sign * motion_config::steps_to_mm(delta_steps, config_.mm_per_step);
         pending_measurement_stats_.last_measured_length = stats_.calibration_reference_length_mm + delta_mm;
-        ESP_LOGI(TAG, "MEASURE: reference_length_mm=%.6f calibration_position_steps=%lld measurement_position_steps=%lld delta_steps=%lld direction_sign=%.1f mm_per_step=%.9f delta_mm=%.6f calculated_length_mm=%.6f", stats_.calibration_reference_length_mm, static_cast<long long>(stats_.calibration_contact_position_steps), static_cast<long long>(pending_measurement_stats_.last_measurement_contact_position_steps), static_cast<long long>(delta_steps), direction_sign, motion_config::MM_PER_STEP, delta_mm, pending_measurement_stats_.last_measured_length);
+        ESP_LOGI(TAG, "MEASURE: reference_length_mm=%.6f calibration_position_steps=%lld measurement_position_steps=%lld delta_steps=%lld direction_sign=%.1f mm_per_step=%.9f delta_mm=%.6f calculated_length_mm=%.6f", stats_.calibration_reference_length_mm, static_cast<long long>(stats_.calibration_contact_position_steps), static_cast<long long>(pending_measurement_stats_.last_measurement_contact_position_steps), static_cast<long long>(delta_steps), direction_sign, config_.mm_per_step, delta_mm, pending_measurement_stats_.last_measured_length);
         pending_measurement_stats_.last_deviation = pending_measurement_stats_.last_measured_length - config_.nominal_length_mm;
         std::strncpy(pending_measurement_stats_.last_result, std::fabs(pending_measurement_stats_.last_deviation) <= config_.tolerance_mm ? "OK" : (pending_measurement_stats_.last_deviation < 0 ? "TOO_SHORT" : "TOO_LONG"), sizeof(pending_measurement_stats_.last_result));
         pending_measurement_stats_.last_result[sizeof(pending_measurement_stats_.last_result) - 1] = 0;
@@ -150,11 +202,11 @@ void MeasurementController::handle_contact() {
         start_retract(true);
     }
 }
-void MeasurementController::start_retract(bool final) { const bool cal = operation_calibration_; retract_total_steps_ = retract_steps_from_config(); if (!retract_total_steps_ || retract_total_steps_ > motion_config::MAX_RETRACT_STEPS) { fail(ErrorCode::MaxStepsReached); return; } const bool pos = !config_.measure_dir_inverted; if (final) { retract_next_state_ = DeviceState::FINISHED; state_ = cal ? DeviceState::CALIBRATE_FINAL_RETRACT : DeviceState::MEASURE_FINAL_RETRACT; } else { retract_next_state_ = cal ? DeviceState::CALIBRATE_FINE : DeviceState::MEASURE_FINE; state_ = cal ? DeviceState::CALIBRATE_RETRACT : DeviceState::MEASURE_RETRACT; } start_motion(state_, pos, motion_config::RETRACT_SPEED_STEPS_S, retract_total_steps_, false); }
-void MeasurementController::tick_retract(uint32_t now) { if (gpio_->contact_active() && now - phase_started_ms_ >= motion_config::CONTACT_RELEASE_TIMEOUT_MS) { fail(ErrorCode::ContactReleaseTimeout); return; } if (motor_->completed_steps() < retract_total_steps_) return; safe_stop(); if (gpio_->contact_active()) { fail(ErrorCode::ContactReleaseTimeout); return; } if (retract_next_state_ == DeviceState::FINISHED) { finish_operation(); return; } optical_absence_started_ms_ = 0; start_motion(retract_next_state_, config_.measure_dir_inverted, motion_config::FINE_SPEED_STEPS_S, retract_next_state_ == DeviceState::CALIBRATE_FINE ? motion_config::MAX_CALIBRATION_STEPS : motion_config::MAX_MEASUREMENT_STEPS, true); }
+void MeasurementController::start_retract(bool final) { const bool cal = operation_calibration_; retract_total_steps_ = retract_steps_from_config(); const uint32_t max_retract_steps = motion_config::mm_to_steps(motion_config::MAX_RETRACT_MM, config_.mm_per_step); if (!retract_total_steps_ || !max_retract_steps || retract_total_steps_ > max_retract_steps) { fail(ErrorCode::MaxStepsReached); return; } const bool pos = !config_.measure_dir_inverted; if (final) { retract_next_state_ = DeviceState::FINISHED; state_ = cal ? DeviceState::CALIBRATE_FINAL_RETRACT : DeviceState::MEASURE_FINAL_RETRACT; } else { retract_next_state_ = cal ? DeviceState::CALIBRATE_FINE : DeviceState::MEASURE_FINE; state_ = cal ? DeviceState::CALIBRATE_RETRACT : DeviceState::MEASURE_RETRACT; } start_motion(state_, pos, motion_config::RETRACT_SPEED_STEPS_S, retract_total_steps_, false); }
+void MeasurementController::tick_retract(uint32_t now) { if (gpio_->contact_active() && now - phase_started_ms_ >= motion_config::CONTACT_RELEASE_TIMEOUT_MS) { fail(ErrorCode::ContactReleaseTimeout); return; } if (motor_->completed_steps() < retract_total_steps_) return; safe_stop(); if (gpio_->contact_active()) { fail(ErrorCode::ContactReleaseTimeout); return; } if (retract_next_state_ == DeviceState::FINISHED) { finish_operation(); return; } optical_absence_started_ms_ = 0; const uint32_t max_steps = motion_config::mm_to_steps(retract_next_state_ == DeviceState::CALIBRATE_FINE ? motion_config::MAX_CALIBRATION_MM : motion_config::MAX_MEASUREMENT_MM, config_.mm_per_step); if (!max_steps) { fail(ErrorCode::InvalidConfig); return; } start_motion(retract_next_state_, config_.measure_dir_inverted, motion_config::FINE_SPEED_STEPS_S, max_steps, true); }
 void MeasurementController::finish_operation() { if (measurement_result_pending_) { if (storage_->save_stats(pending_measurement_stats_) != ESP_OK) { fail(ErrorCode::InternalError); return; } stats_ = pending_measurement_stats_; measurement_result_pending_ = false; ESP_LOGI(TAG, "MEASURE: result committed length=%.3f", stats_.last_measured_length); } if (operation_auto_ && !operation_calibration_) { state_ = DeviceState::AUTO_WAIT_REMOVE; needle_absent_since_ms_ = 0; indicator_->beep_success(); ESP_LOGI(TAG, "AUTO: entered WAIT_REMOVE, needle=%s", gpio_->needle_present() ? "present" : "absent"); return; } operation_auto_ = false; operation_calibration_ = false; state_ = DeviceState::FINISHED; error_ = ErrorCode::None; indicator_->beep_success(); }
 void MeasurementController::start_auto_calibration() { if (!auto_mode_enabled_) return; start_operation(true, true); }
-void MeasurementController::start_auto_load_position() { const double delta = motion_config::AUTO_LOAD_POSITION_MM - config_.auto_calibration_length_mm, raw = delta / motion_config::MM_PER_STEP; if (!std::isfinite(delta) || !std::isfinite(raw) || delta <= 0 || delta > motion_config::MAX_AUTO_LOAD_MM || raw <= 0 || raw > motion_config::MAX_AUTO_LOAD_STEPS) { fail(ErrorCode::MaxStepsReached); return; } auto_load_steps_ = static_cast<uint32_t>(std::llround(raw)); ESP_LOGI(TAG, "AUTO: calibration completed"); ESP_LOGI(TAG, "AUTO: moving to load position %.3f mm (%lu steps)", motion_config::AUTO_LOAD_POSITION_MM, static_cast<unsigned long>(auto_load_steps_)); start_motion(DeviceState::AUTO_MOVE_TO_LOAD, !config_.measure_dir_inverted, motion_config::AUTO_LOAD_SPEED_STEPS_S, motion_config::MAX_AUTO_LOAD_STEPS, false); }
+void MeasurementController::start_auto_load_position() { const double delta = motion_config::AUTO_LOAD_POSITION_MM - config_.auto_calibration_length_mm; const uint32_t max_auto_load_steps = motion_config::mm_to_steps(motion_config::MAX_AUTO_LOAD_MM, config_.mm_per_step); if (!std::isfinite(delta) || delta <= 0 || delta > motion_config::MAX_AUTO_LOAD_MM || !max_auto_load_steps) { fail(ErrorCode::MaxStepsReached); return; } auto_load_steps_ = motion_config::mm_to_steps(delta, config_.mm_per_step); if (!auto_load_steps_ || auto_load_steps_ > max_auto_load_steps) { fail(ErrorCode::MaxStepsReached); return; } ESP_LOGI(TAG, "AUTO: calibration completed"); ESP_LOGI(TAG, "AUTO: moving to load position %.3f mm (%lu steps)", motion_config::AUTO_LOAD_POSITION_MM, static_cast<unsigned long>(auto_load_steps_)); start_motion(DeviceState::AUTO_MOVE_TO_LOAD, !config_.measure_dir_inverted, motion_config::AUTO_LOAD_SPEED_STEPS_S, max_auto_load_steps, false); }
 void MeasurementController::enter_auto_wait_sensor_clear() { state_ = DeviceState::AUTO_WAIT_SENSOR_CLEAR; operation_auto_ = false; operation_calibration_ = false; sensor_clear_since_ms_ = 0; needle_present_since_ms_ = 0; ESP_LOGI(TAG, "AUTO: waiting for optical sensor clear"); }
 void MeasurementController::set_auto_enabled(bool enabled) { auto_mode_enabled_ = enabled; if (!enabled) { operation_auto_ = false; operation_calibration_ = false; } }
 void MeasurementController::begin_contact_candidate(uint32_t now) {
@@ -224,7 +276,7 @@ void MeasurementController::tick_auto(uint32_t now) {
 }
 void MeasurementController::safe_stop() { motor_->stop(); }
 void MeasurementController::fail(ErrorCode e) { safe_stop(); contact_candidate_ = false; measurement_result_pending_ = false; if (auto_mode_enabled_) set_auto_enabled(false); error_ = e; state_ = DeviceState::ERROR; indicator_->beep_error(); ESP_LOGW(TAG, "%s", error_name(e)); }
-uint32_t MeasurementController::retract_steps_from_config() const { const double raw = config_.retract_mm / motion_config::MM_PER_STEP; return std::isfinite(raw) && raw > 0 && raw <= UINT32_MAX ? static_cast<uint32_t>(std::llround(raw)) : 0; }
+uint32_t MeasurementController::retract_steps_from_config() const { return motion_config::mm_to_steps(config_.retract_mm, config_.mm_per_step); }
 void MeasurementController::evaluate_measurement_needle(uint32_t now) { if (!needle_required_for_measurement()) return; if (gpio_->needle_present()) { optical_absence_started_ms_ = 0; return; } if (!optical_absence_started_ms_) { optical_absence_started_ms_ = now; return; } if (now - optical_absence_started_ms_ >= OPTICAL_NEEDLE_LOSS_DEBOUNCE_MS) fail(ErrorCode::NeedleNotFound); }
 void MeasurementController::tick() {
     const uint32_t now = now_ms(), elapsed = now - last_tick_ms_;
@@ -247,6 +299,21 @@ void MeasurementController::tick() {
     motor_->ramp_tick(elapsed);
     check_motion_stall(now);
     if (state_ == DeviceState::ERROR) return;
+    if (state_ == DeviceState::SERVICE_MOVE) {
+        // The motor's max_steps is deliberately the requested target. Check
+        // completion before the generic safety flag so target == max_steps is
+        // a normal completion, never MAX_STEPS_REACHED.
+        if (motor_->completed_steps() >= service_move_target_steps_) {
+            const uint32_t completed_steps = motor_->completed_steps();
+            safe_stop();
+            ESP_LOGI(TAG, "SERVICE MOVE completed: requested_mm=%.3f completed_steps=%lu actual_commanded_mm=%.6f", service_move_requested_mm_, static_cast<unsigned long>(completed_steps), motion_config::steps_to_mm(completed_steps, config_.mm_per_step));
+            state_ = DeviceState::IDLE;
+            error_ = ErrorCode::None;
+            return;
+        }
+        if (motor_->limit_reached()) { fail(ErrorCode::MaxStepsReached); return; }
+        return;
+    }
     if (is_approach()) {
         if (motor_->limit_reached()) { fail(ErrorCode::MaxStepsReached); return; }
         if (now - operation_started_ms_ >= (is_measurement() ? motion_config::MEASUREMENT_TIMEOUT_MS : motion_config::CALIBRATION_TIMEOUT_MS)) { fail(is_measurement() ? ErrorCode::MeasurementTimeout : ErrorCode::CalibrationTimeout); return; }

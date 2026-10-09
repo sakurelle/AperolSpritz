@@ -39,6 +39,8 @@ void IndicatorManager::start_single(uint32_t duration_ms) {
 
 void IndicatorManager::beep_start() { start_single(indicator_config::BUZZER_START_MS); }
 
+void IndicatorManager::beep_calibration_start() { start_single(indicator_config::BUZZER_CALIBRATION_START_MS); }
+
 void IndicatorManager::beep_success() { start_single(indicator_config::BUZZER_SUCCESS_MS); }
 
 void IndicatorManager::beep_error() {

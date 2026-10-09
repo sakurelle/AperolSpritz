@@ -6,6 +6,8 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
+#include <stddef.h>
+
 class ConfigStorage;
 class IndicatorManager;
 class StepperMotor;
@@ -20,6 +22,8 @@ enum class DeviceState : uint8_t {
     CALIBRATE_RETRACT,
     CALIBRATE_FINE,
     CALIBRATE_FINAL_RETRACT,
+    CALIBRATION_PREPARE,
+    AUTO_CALIBRATION_PREPARE,
     AUTO_WAIT_SENSOR_CLEAR,
     AUTO_WAIT_NEEDLE,
     AUTO_WAIT_REMOVE,
@@ -48,6 +52,34 @@ enum class ErrorCode : uint8_t {
 enum class CommandType : uint8_t { Measure, Calibrate, AutoStart, AutoStop, Stop, ResetStop, ResetError, FactoryReset, ServiceMove };
 struct ControllerCommand { CommandType type; double value_mm = 0.0; };
 
+constexpr size_t MEASUREMENT_HISTORY_CAPACITY = 32;
+
+struct MeasurementEvent {
+    uint32_t measurement_seq = 0;
+    char mode[7]{};
+    double length_mm = 0.0;
+    double nominal_mm = 0.0;
+    double tolerance_mm = 0.0;
+    double deviation_mm = 0.0;
+    char result[12]{};
+    char calibration_source[7]{};
+    double calibration_reference_mm = 0.0;
+    int64_t measurement_position_steps = 0;
+    int64_t calibration_position_steps = 0;
+    double mm_per_step = 0.0;
+    uint32_t measurements_since_calibration = 0;
+};
+
+struct MeasurementHistorySnapshot {
+    char device_id[18]{};
+    uint64_t boot_id = 0;
+    uint32_t oldest_seq = 0;
+    uint32_t latest_seq = 0;
+    bool history_gap = false;
+    size_t event_count = 0;
+    MeasurementEvent events[MEASUREMENT_HISTORY_CAPACITY]{};
+};
+
 struct StatusSnapshot {
     DeviceState state;
     ErrorCode error;
@@ -63,6 +95,10 @@ struct StatusSnapshot {
     DeviceConfig config;
     double service_move_requested_mm;
     uint32_t service_move_target_steps;
+    char device_id[18];
+    uint64_t boot_id;
+    uint32_t latest_measurement_seq;
+    bool auto_stop_requested;
 };
 
 class MeasurementController {
@@ -73,6 +109,7 @@ public:
     bool enqueue_service_move(double distance_mm, const char **reason = nullptr);
     bool update_config(const DeviceConfig &, const char **);
     bool snapshot(StatusSnapshot &);
+    bool measurement_history(int64_t after_seq, MeasurementHistorySnapshot &);
     double calculate_length(int64_t measurement_position_steps) const;
 
 private:
@@ -82,6 +119,7 @@ private:
     void process_command(const ControllerCommand &);
     void tick();
     void start_operation(bool calibration, bool automatic = false);
+    void start_calibration_motion();
     void start_service_move(double distance_mm);
     bool start_motion(DeviceState state, bool direction_positive, uint32_t speed, uint32_t max_steps, bool stop_on_contact);
     void handle_contact();
@@ -98,6 +136,7 @@ private:
     bool tick_contact_candidate(uint32_t now);
     void check_motion_stall(uint32_t now);
     void set_auto_enabled(bool enabled);
+    void record_measurement_event(bool automatic);
     void fail(ErrorCode);
     void safe_stop();
     bool debounced(uint32_t now, uint32_t &last) const;
@@ -137,6 +176,7 @@ private:
     uint32_t last_motion_progress_ms_ = 0;
     DeviceStats pending_measurement_stats_{};
     bool auto_mode_enabled_ = false;
+    bool auto_stop_requested_ = false;
     bool operation_auto_ = false;
     bool operation_calibration_ = false;
     uint32_t needle_present_since_ms_ = 0;
@@ -145,6 +185,12 @@ private:
     uint32_t auto_load_steps_ = 0;
     double service_move_requested_mm_ = 0.0;
     uint32_t service_move_target_steps_ = 0;
+    char device_id_[18]{};
+    uint64_t boot_id_ = 0;
+    uint32_t next_measurement_seq_ = 0;
+    MeasurementEvent measurement_history_[MEASUREMENT_HISTORY_CAPACITY]{};
+    size_t measurement_history_head_ = 0;
+    size_t measurement_history_count_ = 0;
 };
 
 const char *state_name(DeviceState);

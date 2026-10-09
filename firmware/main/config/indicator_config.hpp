@@ -8,6 +8,7 @@ constexpr bool BUZZER_INVERTED = false;
 constexpr bool STATUS_LED_INVERTED = true;
 
 constexpr uint32_t BUZZER_START_MS = 60;
+constexpr uint32_t BUZZER_CALIBRATION_START_MS = 1000;
 constexpr uint32_t BUZZER_SUCCESS_MS = 180;
 
 constexpr uint32_t BUZZER_ERROR_ON_MS = 80;

@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-constexpr uint32_t CONFIG_VERSION = 5;
+constexpr uint32_t CONFIG_VERSION = 6;
 
 struct DeviceConfig {
     uint32_t config_version = CONFIG_VERSION;
@@ -14,6 +14,7 @@ struct DeviceConfig {
     double retract_mm = 2.0;
     bool measure_dir_inverted = false;
     double mm_per_step = motion_config::DEFAULT_MM_PER_STEP;
+    uint32_t auto_calibration_interval = 1;
 };
 
 enum class CalibrationSource : uint8_t { None, Manual, Auto };
@@ -22,6 +23,7 @@ struct DeviceStats {
     double last_measured_length = 0.0;
     double last_deviation = 0.0;
     uint32_t measurements_since_calibration = 0;
+    uint32_t auto_measurements_since_calibration = 0;
     uint32_t total_measurements = 0;
     uint32_t calibration_count = 0;
     uint32_t last_measurement_steps = 0;
@@ -32,6 +34,7 @@ struct DeviceStats {
     CalibrationSource calibration_source = CalibrationSource::None;
     bool calibration_valid = false;
     char last_result[12] = "NONE";
+    uint32_t stats_version = CONFIG_VERSION;
 };
 
 DeviceConfig default_config();

@@ -5,12 +5,14 @@
 #include "wifi/wifi_manager.hpp"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 namespace {
 constexpr char TAG[] = "web";
@@ -88,12 +90,14 @@ const char PAGE[] = R"HTML(
           <dt>Ошибка</dt><dd id="error">—</dd>
           <dt>Wi‑Fi</dt><dd id="wifi">—</dd>
           <dt>IP</dt><dd id="ip">—</dd>
+          <dt>Приложение</dt><dd id="logger">Не подключено</dd>
           <dt>Текущая фаза</dt><dd id="phase">—</dd>
           <dt>Автоматический режим</dt><dd id="auto-state">—</dd>
           <dt>Автофаза</dt><dd id="auto-phase">—</dd>
           <dt>Калибровка</dt><dd id="calibration-source">—</dd>
           <dt>Опорная длина</dt><dd id="calibration-reference">—</dd>
           <dt>Измерений после калибровки</dt><dd id="measurements-since-calibration">—</dd>
+          <dt>Автокалибровка</dt><dd id="auto-calibration-progress">—</dd>
         </dl>
       </section>
     </section>
@@ -107,6 +111,7 @@ const char PAGE[] = R"HTML(
           <div class="field"><label for="calibration_length_mm">Длина ручного калибра</label><div class="input-wrap"><input id="calibration_length_mm" type="number" step="0.001" required><span class="unit">мм</span></div></div>
           <div class="field"><label for="auto_calibration_length_mm">Длина автокалибра</label><div class="input-wrap"><input id="auto_calibration_length_mm" type="number" step="0.001" required><span class="unit">мм</span></div></div>
           <div class="field"><label for="retract_mm">Расстояние отъезда</label><div class="input-wrap"><input id="retract_mm" type="number" step="0.001" min="0" required><span class="unit">мм</span></div></div>
+          <div class="field"><label for="auto_calibration_interval">Автокалибровка каждые</label><div class="input-wrap"><input id="auto_calibration_interval" type="number" step="1" min="1" max="1000" required><span class="unit">изм.</span></div></div>
           <label class="check-field" for="measure_dir_inverted"><input id="measure_dir_inverted" type="checkbox">Инвертировать DIR</label>
         </div>
         <div class="settings-actions"><button class="btn btn-primary" type="submit">Сохранить настройки</button></div>
@@ -145,11 +150,12 @@ const char PAGE[] = R"HTML(
     </section>
   </main>
   <script>
-    const phaseNames={IDLE:'Ожидание',MEASURE_FAST:'Быстрый проход',MEASURE_RETRACT:'Отъезд',MEASURE_FINE:'Точное измерение',MEASURE_FINAL_RETRACT:'Финальный отъезд',CALIBRATE_FAST:'Калибровка: быстрый проход',CALIBRATE_RETRACT:'Калибровка: отъезд',CALIBRATE_FINE:'Калибровка: точное касание',CALIBRATE_FINAL_RETRACT:'Калибровка: финальный отъезд',AUTO_WAIT_SENSOR_CLEAR:'Ожидание освобождения датчика',AUTO_WAIT_NEEDLE:'Ожидание иглы',AUTO_WAIT_REMOVE:'Ожидание снятия иглы',AUTO_MOVE_TO_LOAD:'Возврат в загрузочную позицию',MANUAL_LEFT:'Ручное перемещение',SERVICE_MOVE:'Сервисное перемещение',FINISHED:'Операция завершена',STOPPED:'STOP',ERROR:'Ошибка'};
+    const phaseNames={IDLE:'Ожидание',MEASURE_FAST:'Быстрый проход',MEASURE_RETRACT:'Отъезд',MEASURE_FINE:'Точное измерение',MEASURE_FINAL_RETRACT:'Финальный отъезд',CALIBRATION_PREPARE:'Подготовка калибровки',AUTO_CALIBRATION_PREPARE:'Подготовка автокалибровки',CALIBRATE_FAST:'Калибровка: быстрый проход',CALIBRATE_RETRACT:'Калибровка: отъезд',CALIBRATE_FINE:'Калибровка: точное касание',CALIBRATE_FINAL_RETRACT:'Калибровка: финальный отъезд',AUTO_WAIT_SENSOR_CLEAR:'Ожидание освобождения датчика',AUTO_WAIT_NEEDLE:'Ожидание иглы',AUTO_WAIT_REMOVE:'Ожидание снятия иглы',AUTO_MOVE_TO_LOAD:'Возврат в загрузочную позицию',MANUAL_LEFT:'Ручное перемещение',SERVICE_MOVE:'Сервисное перемещение',FINISHED:'Операция завершена',STOPPED:'STOP',ERROR:'Ошибка'};
     const errorNames={NONE:'Нет',NEEDLE_NOT_FOUND:'Игла не обнаружена',CONTACT_ALREADY_ACTIVE:'CONTACT уже активен',CONTACT_RELEASE_TIMEOUT:'CONTACT не освободился вовремя',MEASUREMENT_TIMEOUT:'Тайм-аут измерения',CALIBRATION_TIMEOUT:'Тайм-аут калибровки',MAX_STEPS_REACHED:'Достигнут лимит шагов',NOT_CALIBRATED:'Нет калибровки',STOP_ACTIVE:'Активен STOP',INVALID_CONFIG:'Некорректные настройки',INTERNAL_ERROR:'Внутренняя ошибка'};
     let currentStatus=null;
     let lastServiceCommandMm=0;
     let recommendedMmPerStep=null;
+    let autoRequestPending=false;
     const byId=id=>document.getElementById(id);
     const number=(value,digits=3)=>Number(value).toFixed(digits);
     const mm=(value,digits=3)=>`${number(value,digits)} мм`;
@@ -207,13 +213,15 @@ const char PAGE[] = R"HTML(
       setText('stop',stopActive?'АКТИВЕН':'Нормально');byId('stop').className=stopActive?'value-alert':'value-ok';
       setText('error',errorNames[error]||error);byId('error').className=error==='NONE'?'value-ok':'value-alert';
       setText('wifi',status.wifi_connected?`${status.wifi_mode}: подключён`:`${status.wifi_mode}: отключён`);setText('ip',status.ip_address||'—');
+      setText('logger',status.logger_connected?(status.logger_client_name?`Подключено — ${status.logger_client_name}`:'Подключено'):'Не подключено');byId('logger').className=status.logger_connected?'value-ok':'';
       setText('phase',phaseNames[status.state]||status.state);setText('auto-state',status.auto_mode_enabled?'ВКЛ':'ВЫКЛ');setText('auto-phase',status.auto_phase||'—');
       setText('calibration-source',status.calibration_source==='AUTO'?'Автоматическая':status.calibration_source==='MANUAL'?'Ручная':'Нет калибровки');
       setText('calibration-reference',status.calibration_valid?mm(status.calibration_reference_length_mm):'Нет калибровки');
       setText('measurements-since-calibration',String(status.measurements_since_calibration??0));
+      setText('auto-calibration-progress',`${status.auto_measurements_since_calibration??0} / ${status.auto_calibration_interval??1}; до следующей: ${status.auto_calibration_remaining??0}`);
       setServiceSummary(status);
       const busy=isBusy(status.state);byId('measure').disabled=busy||status.auto_mode_enabled;byId('calibrate').disabled=busy||status.auto_mode_enabled;
-      const auto=byId('auto');auto.textContent=`Авто: ${status.auto_mode_enabled?'ВКЛ':'ВЫКЛ'}`;auto.className=`btn ${status.auto_mode_enabled?'btn-auto-on':'btn-secondary'}`;auto.disabled=busy;
+      const auto=byId('auto');auto.textContent=status.auto_stop_requested?'Авто: выключение…':status.auto_mode_enabled?'Выключить авто':'Включить авто';auto.className=`btn ${status.auto_mode_enabled?'btn-auto-on':'btn-secondary'}`;auto.disabled=autoRequestPending||stopActive||error!=='NONE'||(!status.auto_mode_enabled&&busy);
       byId('reset-stop').disabled=status.state!=='STOPPED';byId('reset-error').disabled=status.state!=='ERROR';
       byId('service-move').disabled=busy||status.auto_mode_enabled||stopActive||error!=='NONE';
       if(recommendedMmPerStep===null)byId('service-apply').disabled=true;
@@ -223,8 +231,8 @@ const char PAGE[] = R"HTML(
     }
     async function request(path){const response=await fetch(`/api/${path}`,{method:'POST'});if(!response.ok)throw new Error(await response.text()||'Команда отклонена');showMessage('Команда принята');await refreshStatus();}
     async function refreshStatus(){try{const response=await fetch('/api/status');if(!response.ok)throw new Error();put(await response.json());}catch(_){setText('connection','Нет связи с устройством');showMessage('Не удалось получить состояние устройства.',true);}}
-    async function loadConfig(){try{const response=await fetch('/api/config');if(!response.ok)throw new Error();const config=await response.json();for(const key of ['nominal_length_mm','tolerance_mm','calibration_length_mm','auto_calibration_length_mm','retract_mm'])byId(key).value=config[key];byId('measure_dir_inverted').checked=Boolean(config.measure_dir_inverted);}catch(_){showMessage('Не удалось загрузить настройки.',true);}}
-    async function saveConfig(event){event.preventDefault();const config={};for(const key of ['nominal_length_mm','tolerance_mm','calibration_length_mm','auto_calibration_length_mm','retract_mm'])config[key]=Number(byId(key).value);config.measure_dir_inverted=byId('measure_dir_inverted').checked;try{const response=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)});if(!response.ok)throw new Error(await response.text()||'Настройки отклонены');showMessage('Настройки сохранены');await refreshStatus();}catch(error){showMessage(error.message||'Не удалось сохранить настройки.',true);}}
+    async function loadConfig(){try{const response=await fetch('/api/config');if(!response.ok)throw new Error();const config=await response.json();for(const key of ['nominal_length_mm','tolerance_mm','calibration_length_mm','auto_calibration_length_mm','retract_mm','auto_calibration_interval'])byId(key).value=config[key];byId('measure_dir_inverted').checked=Boolean(config.measure_dir_inverted);}catch(_){showMessage('Не удалось загрузить настройки.',true);}}
+    async function saveConfig(event){event.preventDefault();const config={};for(const key of ['nominal_length_mm','tolerance_mm','calibration_length_mm','auto_calibration_length_mm','retract_mm','auto_calibration_interval'])config[key]=Number(byId(key).value);config.measure_dir_inverted=byId('measure_dir_inverted').checked;try{const response=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)});if(!response.ok)throw new Error(await response.text()||'Настройки отклонены');showMessage('Настройки сохранены');await refreshStatus();}catch(error){showMessage(error.message||'Не удалось сохранить настройки.',true);}}
     async function serviceMove(event){
       event.preventDefault();
       const distanceMm=Number(byId('service-distance-mm').value);
@@ -247,7 +255,7 @@ const char PAGE[] = R"HTML(
     }
     byId('measure').addEventListener('click',()=>request('measure').catch(error=>showMessage(error.message,true)));
     byId('calibrate').addEventListener('click',()=>request('calibrate').catch(error=>showMessage(error.message,true)));
-    byId('auto').addEventListener('click',()=>request(currentStatus&&currentStatus.auto_mode_enabled?'auto/stop':'auto/start').catch(error=>showMessage(error.message,true)));
+    byId('auto').addEventListener('click',async()=>{if(autoRequestPending)return;autoRequestPending=true;byId('auto').disabled=true;try{await request(currentStatus&&currentStatus.auto_mode_enabled?'auto/stop':'auto/start');}catch(error){showMessage(error.message,true);}finally{autoRequestPending=false;if(currentStatus)put(currentStatus);}});
     byId('stop-command').addEventListener('click',()=>request('stop').catch(error=>showMessage(error.message,true)));
     byId('reset-stop').addEventListener('click',()=>request('reset-stop').catch(error=>showMessage(error.message,true)));
     byId('reset-error').addEventListener('click',()=>request('reset-error').catch(error=>showMessage(error.message,true)));
@@ -292,10 +300,13 @@ esp_err_t status(httpd_req_t *request) {
     StatusSnapshot measurement{};
     WifiStatus wifi{};
     if (!snapshot(request, measurement, wifi)) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Controller unavailable");
-    char body[2200];
+    auto *web = context(request);
+    const LoggerSnapshot logger = web && web->server ? web->server->logger_snapshot() : LoggerSnapshot{};
+    const uint32_t remaining = measurement.stats.auto_measurements_since_calibration >= measurement.config.auto_calibration_interval ? 0 : measurement.config.auto_calibration_interval - measurement.stats.auto_measurements_since_calibration;
+    char body[2600];
     const int length = std::snprintf(body, sizeof(body),
-        "{\"state\":\"%s\",\"error\":\"%s\",\"needle_present\":%s,\"contact\":%s,\"stop_active\":%s,\"motor_enabled\":%s,\"auto_mode_enabled\":%s,\"auto_phase\":\"%s\",\"current_speed_steps_s\":%lu,\"position_steps\":%lld,\"last_length_mm\":%.6f,\"nominal_length_mm\":%.6f,\"deviation_mm\":%.6f,\"tolerance_mm\":%.6f,\"result\":\"%s\",\"calibration_valid\":%s,\"calibration_source\":\"%s\",\"calibration_reference_length_mm\":%.6f,\"measurements_since_calibration\":%lu,\"mm_per_step\":%.9f,\"service_move_requested_mm\":%.6f,\"service_move_target_steps\":%lu,\"wifi_mode\":\"%s\",\"wifi_connected\":%s,\"ip_address\":\"%s\"}",
-        state_name(measurement.state), error_name(measurement.error), measurement.needle_present ? "true" : "false", measurement.contact ? "true" : "false", measurement.stop_active ? "true" : "false", measurement.motor_enabled ? "true" : "false", measurement.auto_mode_enabled ? "true" : "false", measurement.auto_phase, static_cast<unsigned long>(measurement.current_speed_steps_s), static_cast<long long>(measurement.position_steps), measurement.stats.last_measured_length, measurement.config.nominal_length_mm, measurement.stats.last_deviation, measurement.config.tolerance_mm, measurement.stats.last_result, measurement.stats.calibration_valid ? "true" : "false", calibration_source_name(measurement.stats.calibration_source), measurement.stats.calibration_reference_length_mm, static_cast<unsigned long>(measurement.stats.measurements_since_calibration), measurement.config.mm_per_step, measurement.service_move_requested_mm, static_cast<unsigned long>(measurement.service_move_target_steps), wifi_mode_name(wifi.mode), wifi.connected ? "true" : "false", wifi.ip_address);
+        "{\"state\":\"%s\",\"error\":\"%s\",\"needle_present\":%s,\"contact\":%s,\"stop_active\":%s,\"motor_enabled\":%s,\"auto_mode_enabled\":%s,\"auto_stop_requested\":%s,\"auto_phase\":\"%s\",\"current_speed_steps_s\":%lu,\"position_steps\":%lld,\"last_length_mm\":%.6f,\"nominal_length_mm\":%.6f,\"deviation_mm\":%.6f,\"tolerance_mm\":%.6f,\"result\":\"%s\",\"calibration_valid\":%s,\"calibration_source\":\"%s\",\"calibration_reference_length_mm\":%.6f,\"measurements_since_calibration\":%lu,\"auto_calibration_interval\":%lu,\"auto_measurements_since_calibration\":%lu,\"auto_calibration_remaining\":%lu,\"mm_per_step\":%.9f,\"service_move_requested_mm\":%.6f,\"service_move_target_steps\":%lu,\"device_id\":\"%s\",\"boot_id\":\"%016llx\",\"latest_measurement_seq\":%lu,\"logger_connected\":%s,\"logger_client_name\":\"%s\",\"wifi_mode\":\"%s\",\"wifi_connected\":%s,\"ip_address\":\"%s\"}",
+        state_name(measurement.state), error_name(measurement.error), measurement.needle_present ? "true" : "false", measurement.contact ? "true" : "false", measurement.stop_active ? "true" : "false", measurement.motor_enabled ? "true" : "false", measurement.auto_mode_enabled ? "true" : "false", measurement.auto_stop_requested ? "true" : "false", measurement.auto_phase, static_cast<unsigned long>(measurement.current_speed_steps_s), static_cast<long long>(measurement.position_steps), measurement.stats.last_measured_length, measurement.config.nominal_length_mm, measurement.stats.last_deviation, measurement.config.tolerance_mm, measurement.stats.last_result, measurement.stats.calibration_valid ? "true" : "false", calibration_source_name(measurement.stats.calibration_source), measurement.stats.calibration_reference_length_mm, static_cast<unsigned long>(measurement.stats.measurements_since_calibration), static_cast<unsigned long>(measurement.config.auto_calibration_interval), static_cast<unsigned long>(measurement.stats.auto_measurements_since_calibration), static_cast<unsigned long>(remaining), measurement.config.mm_per_step, measurement.service_move_requested_mm, static_cast<unsigned long>(measurement.service_move_target_steps), measurement.device_id, static_cast<unsigned long long>(measurement.boot_id), static_cast<unsigned long>(measurement.latest_measurement_seq), logger.connected ? "true" : "false", logger.client_name, wifi_mode_name(wifi.mode), wifi.connected ? "true" : "false", wifi.ip_address);
     return length < 0 || static_cast<size_t>(length) >= sizeof(body) ? ESP_ERR_NO_MEM : json(request, body);
 }
 
@@ -303,8 +314,8 @@ esp_err_t get_config(httpd_req_t *request) {
     StatusSnapshot measurement{};
     WifiStatus wifi{};
     if (!snapshot(request, measurement, wifi)) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Controller unavailable");
-    char body[512];
-    const int length = std::snprintf(body, sizeof(body), "{\"nominal_length_mm\":%.6f,\"tolerance_mm\":%.6f,\"calibration_length_mm\":%.6f,\"auto_calibration_length_mm\":%.6f,\"retract_mm\":%.6f,\"measure_dir_inverted\":%s,\"mm_per_step\":%.9f}", measurement.config.nominal_length_mm, measurement.config.tolerance_mm, measurement.config.calibration_length_mm, measurement.config.auto_calibration_length_mm, measurement.config.retract_mm, measurement.config.measure_dir_inverted ? "true" : "false", measurement.config.mm_per_step);
+    char body[640];
+    const int length = std::snprintf(body, sizeof(body), "{\"nominal_length_mm\":%.6f,\"tolerance_mm\":%.6f,\"calibration_length_mm\":%.6f,\"auto_calibration_length_mm\":%.6f,\"retract_mm\":%.6f,\"measure_dir_inverted\":%s,\"mm_per_step\":%.9f,\"auto_calibration_interval\":%lu}", measurement.config.nominal_length_mm, measurement.config.tolerance_mm, measurement.config.calibration_length_mm, measurement.config.auto_calibration_length_mm, measurement.config.retract_mm, measurement.config.measure_dir_inverted ? "true" : "false", measurement.config.mm_per_step, static_cast<unsigned long>(measurement.config.auto_calibration_interval));
     return length < 0 || static_cast<size_t>(length) >= sizeof(body) ? ESP_ERR_NO_MEM : json(request, body);
 }
 
@@ -347,6 +358,33 @@ bool optional_bool(const char *body, const char *key, bool &out) {
     return false;
 }
 
+bool optional_uint32(const char *body, const char *key, uint32_t &out) {
+    const char *position = value(body, key);
+    if (!position) return true;
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(position, &end, 10);
+    if (end == position || parsed > UINT32_MAX) return false;
+    while (std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (*end != ',' && *end != '}' && *end != 0) return false;
+    out = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+bool json_string(const char *body, const char *key, char *out, size_t out_size) {
+    const char *position = value(body, key);
+    if (!position || *position++ != '"' || out_size == 0) return false;
+    size_t written = 0;
+    while (*position && *position != '"') {
+        const unsigned char ch = static_cast<unsigned char>(*position++);
+        if (ch < 32 || ch > 126 || ch == '\\') return false;
+        if (written + 1 >= out_size) return false;
+        out[written++] = static_cast<char>(ch);
+    }
+    if (*position != '"') return false;
+    out[written] = 0;
+    return true;
+}
+
 bool request_body(httpd_req_t *request, char *body, size_t size) {
     if (request->content_len <= 0 || static_cast<size_t>(request->content_len) >= size) return false;
     int received = 0;
@@ -366,7 +404,7 @@ esp_err_t post_config(httpd_req_t *request) {
     WifiStatus wifi{};
     if (!snapshot(request, measurement, wifi)) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Controller unavailable");
     DeviceConfig config = measurement.config;
-    const bool valid = value(body, "mm_per_step") == nullptr && optional_double(body, "nominal_length_mm", config.nominal_length_mm) && optional_double(body, "tolerance_mm", config.tolerance_mm) && optional_double(body, "calibration_length_mm", config.calibration_length_mm) && optional_double(body, "auto_calibration_length_mm", config.auto_calibration_length_mm) && optional_double(body, "retract_mm", config.retract_mm) && optional_bool(body, "measure_dir_inverted", config.measure_dir_inverted);
+    const bool valid = value(body, "mm_per_step") == nullptr && optional_double(body, "nominal_length_mm", config.nominal_length_mm) && optional_double(body, "tolerance_mm", config.tolerance_mm) && optional_double(body, "calibration_length_mm", config.calibration_length_mm) && optional_double(body, "auto_calibration_length_mm", config.auto_calibration_length_mm) && optional_double(body, "retract_mm", config.retract_mm) && optional_bool(body, "measure_dir_inverted", config.measure_dir_inverted) && optional_uint32(body, "auto_calibration_interval", config.auto_calibration_interval);
     const char *reason = nullptr;
     auto *web = context(request);
     if (!valid || !web || !web->controller || !web->controller->update_config(config, &reason)) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, reason ? reason : "Settings rejected");
@@ -408,6 +446,48 @@ esp_err_t post_service_mm_per_step(httpd_req_t *request) {
     return json(request, "{\"ok\":true,\"calibration_invalidated\":true}");
 }
 
+esp_err_t measurements(httpd_req_t *request) {
+    int64_t after_seq = -1;
+    const size_t query_length = httpd_req_get_url_query_len(request);
+    if (query_length > 0 && query_length < 96) {
+        char query[96]{};
+        char raw_after[24]{};
+        if (httpd_req_get_url_query_str(request, query, sizeof(query)) == ESP_OK && httpd_query_key_value(query, "after_seq", raw_after, sizeof(raw_after)) == ESP_OK) {
+            char *end = nullptr;
+            after_seq = std::strtoll(raw_after, &end, 10);
+            if (end == raw_after || *end != 0 || after_seq < -1 || after_seq > UINT32_MAX) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid after_seq");
+        }
+    }
+    auto *web = context(request);
+    if (!web || !web->controller) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Controller unavailable");
+    MeasurementHistorySnapshot *history = new (std::nothrow) MeasurementHistorySnapshot{};
+    if (!history) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+    if (!web->controller->measurement_history(after_seq, *history)) { delete history; return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Controller unavailable"); }
+    httpd_resp_set_type(request, HTTPD_TYPE_JSON);
+    char chunk[768];
+    int length = std::snprintf(chunk, sizeof(chunk), "{\"device_id\":\"%s\",\"boot_id\":\"%016llx\",\"oldest_seq\":%lu,\"latest_seq\":%lu,\"history_gap\":%s,\"events\":[", history->device_id, static_cast<unsigned long long>(history->boot_id), static_cast<unsigned long>(history->oldest_seq), static_cast<unsigned long>(history->latest_seq), history->history_gap ? "true" : "false");
+    esp_err_t error = length < 0 || static_cast<size_t>(length) >= sizeof(chunk) ? ESP_ERR_NO_MEM : httpd_resp_send_chunk(request, chunk, length);
+    for (size_t i = 0; error == ESP_OK && i < history->event_count; ++i) {
+        const MeasurementEvent &event = history->events[i];
+        length = std::snprintf(chunk, sizeof(chunk), "%s{\"device_id\":\"%s\",\"boot_id\":\"%016llx\",\"measurement_seq\":%lu,\"mode\":\"%s\",\"length_mm\":%.6f,\"nominal_mm\":%.6f,\"tolerance_mm\":%.6f,\"deviation_mm\":%.6f,\"result\":\"%s\",\"calibration_source\":\"%s\",\"calibration_reference_mm\":%.6f,\"measurement_position_steps\":%lld,\"calibration_position_steps\":%lld,\"mm_per_step\":%.9f,\"measurements_since_calibration\":%lu}", i ? "," : "", history->device_id, static_cast<unsigned long long>(history->boot_id), static_cast<unsigned long>(event.measurement_seq), event.mode, event.length_mm, event.nominal_mm, event.tolerance_mm, event.deviation_mm, event.result, event.calibration_source, event.calibration_reference_mm, static_cast<long long>(event.measurement_position_steps), static_cast<long long>(event.calibration_position_steps), event.mm_per_step, static_cast<unsigned long>(event.measurements_since_calibration));
+        error = length < 0 || static_cast<size_t>(length) >= sizeof(chunk) ? ESP_ERR_NO_MEM : httpd_resp_send_chunk(request, chunk, length);
+    }
+    delete history;
+    if (error != ESP_OK) return error;
+    error = httpd_resp_send_chunk(request, "]}", 2);
+    return error == ESP_OK ? httpd_resp_send_chunk(request, nullptr, 0) : error;
+}
+
+esp_err_t logger_heartbeat(httpd_req_t *request) {
+    char body[384];
+    char client_name[48]{};
+    if (!request_body(request, body, sizeof(body)) || !json_string(body, "client_name", client_name, sizeof(client_name))) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid client_name");
+    auto *web = context(request);
+    if (!web || !web->server) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Server unavailable");
+    web->server->record_logger_heartbeat(client_name);
+    return json(request, "{\"ok\":true}");
+}
+
 esp_err_t command(httpd_req_t *request) {
     auto *web = context(request);
     if (!web || !web->controller) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Controller unavailable");
@@ -421,12 +501,32 @@ esp_err_t command(httpd_req_t *request) {
 }
 } // namespace
 
+void WebServer::record_logger_heartbeat(const char *client_name) {
+    portENTER_CRITICAL(&logger_lock_);
+    last_logger_heartbeat_ms_ = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    std::snprintf(logger_client_name_, sizeof(logger_client_name_), "%s", client_name ? client_name : "");
+    portEXIT_CRITICAL(&logger_lock_);
+}
+
+LoggerSnapshot WebServer::logger_snapshot() const {
+    LoggerSnapshot result{};
+    uint32_t heartbeat_ms = 0;
+    portENTER_CRITICAL(&logger_lock_);
+    heartbeat_ms = last_logger_heartbeat_ms_;
+    std::snprintf(result.client_name, sizeof(result.client_name), "%s", logger_client_name_);
+    portEXIT_CRITICAL(&logger_lock_);
+    const uint32_t current_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    result.connected = heartbeat_ms != 0 && current_ms - heartbeat_ms < 5000;
+    if (!result.connected) result.client_name[0] = 0;
+    return result;
+}
+
 esp_err_t WebServer::start(MeasurementController *controller, WifiManager *wifi) {
     if (!controller || !wifi) return ESP_ERR_INVALID_ARG;
     if (server_) return ESP_ERR_INVALID_STATE;
-    context_ = {controller, wifi};
+    context_ = {controller, wifi, this};
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 20;
     httpd_handle_t server = nullptr;
     esp_err_t error = httpd_start(&server, &config);
     if (error != ESP_OK) return error;
@@ -435,6 +535,8 @@ esp_err_t WebServer::start(MeasurementController *controller, WifiManager *wifi)
         {.uri = "/api/status", .method = HTTP_GET, .handler = status, .user_ctx = &context_},
         {.uri = "/api/config", .method = HTTP_GET, .handler = get_config, .user_ctx = &context_},
         {.uri = "/api/config", .method = HTTP_POST, .handler = post_config, .user_ctx = &context_},
+        {.uri = "/api/measurements", .method = HTTP_GET, .handler = measurements, .user_ctx = &context_},
+        {.uri = "/api/logger/heartbeat", .method = HTTP_POST, .handler = logger_heartbeat, .user_ctx = &context_},
         {.uri = "/api/service-move", .method = HTTP_POST, .handler = post_service_move, .user_ctx = &context_},
         {.uri = "/api/service/mm-per-step", .method = HTTP_POST, .handler = post_service_mm_per_step, .user_ctx = &context_},
         {.uri = "/api/measure", .method = HTTP_POST, .handler = command, .user_ctx = &context_},

@@ -1,0 +1,7 @@
+{
+    "platformio-ide.useBuiltinPIOCore": true,
+    "platformio-ide.customPATH": "",
+    "files.exclude": {
+        "firmware/.pio": true
+    }
+}

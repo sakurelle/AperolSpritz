@@ -9,6 +9,7 @@ public:
     esp_err_t init();
 
     void beep_start();
+    void beep_calibration_start();
     void beep_success();
     void beep_error();
 

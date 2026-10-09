@@ -38,4 +38,4 @@ idf_component_register(
          "web/web_server.cpp"
          "wifi/wifi_manager.cpp"
     INCLUDE_DIRS "." "gpio" "motor" "indication" "measurement" "config" "web" "wifi" "${GENERATED_INCLUDE_DIR}"
-    REQUIRES esp_driver_gpio esp_driver_gptimer esp_timer esp_event esp_netif esp_http_server esp_wifi nvs_flash wpa_supplicant)
+    REQUIRES esp_driver_gpio esp_driver_gptimer esp_timer esp_event esp_hw_support esp_netif esp_http_server esp_wifi nvs_flash wpa_supplicant)

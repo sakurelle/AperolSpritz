@@ -6,10 +6,16 @@ firmware/sdkconfig.old
 firmware/sdkconfig.*
 !firmware/sdkconfig.defaults
 firmware/secrets.txt
+/secrets.txt
+# Generated SDK configuration at repository root (legacy/PlatformIO)
+/sdkconfig
+/sdkconfig.*
+!/sdkconfig.defaults
+
 .pio/
 .vscode/*
 !.vscode/extensions.json
-!.vscode/settings.json
+.vscode/settings.json
 desktop/.venv/
 desktop/venv/
 desktop/__pycache__/
@@ -18,3 +24,4 @@ desktop/data/
 desktop/exports/
 *.bak
 *.m3~
+diagnostics/

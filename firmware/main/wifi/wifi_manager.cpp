@@ -3,6 +3,7 @@
 #include "esp_eap_client.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "wifi_secrets.hpp"
 
@@ -18,6 +19,20 @@ constexpr EventBits_t STA_CONNECTED_BIT = BIT0;
 bool equals(const char *left, const char *right) {
     return std::strcmp(left, right) == 0;
 }
+
+const char *disconnect_reason_name(uint8_t reason) {
+    switch (reason) {
+    case WIFI_REASON_AUTH_EXPIRE: return "auth expired";
+    case WIFI_REASON_AUTH_LEAVE: return "auth leave";
+    case WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY: return "disassociated due to inactivity";
+    case WIFI_REASON_BEACON_TIMEOUT: return "beacon timeout";
+    case WIFI_REASON_NO_AP_FOUND: return "AP not found";
+    case WIFI_REASON_AUTH_FAIL: return "authentication failed";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT: return "handshake timeout";
+    case WIFI_REASON_CONNECTION_FAIL: return "connection failed";
+    default: return "other";
+    }
+}
 }
 
 const char *wifi_mode_name(WifiMode mode) {
@@ -31,7 +46,6 @@ const char *wifi_mode_name(WifiMode mode) {
 
 void WifiManager::set_status(WifiMode mode, bool connected, const char *ssid, const char *ip_address) {
     portENTER_CRITICAL(&status_lock_);
-    status_ = {};
     status_.mode = mode;
     status_.connected = connected;
     std::snprintf(status_.ssid, sizeof(status_.ssid), "%s", ssid ? ssid : "");
@@ -145,19 +159,40 @@ void WifiManager::event_handler(void *arg, esp_event_base_t base, int32_t event_
     }
     if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         if (!self->fallback_active_) {
+            const auto *event = static_cast<wifi_event_sta_disconnected_t *>(event_data);
+            const uint16_t reason = event ? event->reason : 0;
+            const int8_t rssi = event ? event->rssi : 0;
+            const uint32_t now = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+            const uint32_t connected_ms = self->connected_since_ms_ == 0 ? 0 : now - self->connected_since_ms_;
+            self->connected_since_ms_ = 0;
             self->set_status(WifiMode::Station, false, NEEDLE_WIFI_SSID, "");
-            ESP_LOGW(TAG, "WiFi STA disconnected; reconnecting");
-            esp_wifi_connect();
+            portENTER_CRITICAL(&self->status_lock_);
+            self->status_.rssi = rssi;
+            self->status_.last_disconnect_reason = reason;
+            const uint32_t reconnect_count = ++self->status_.reconnect_count;
+            portEXIT_CRITICAL(&self->status_lock_);
+            ESP_LOGW(TAG, "WiFi STA disconnected: reason=%u (%s) rssi=%d connected_ms=%lu reconnect=%lu",
+                     static_cast<unsigned>(reason), disconnect_reason_name(reason), static_cast<int>(rssi),
+                     static_cast<unsigned long>(connected_ms), static_cast<unsigned long>(reconnect_count));
+            const esp_err_t error = esp_wifi_connect();
+            if (error != ESP_OK) ESP_LOGE(TAG, "WiFi reconnect failed: %s", esp_err_to_name(error));
         }
         return;
     }
     if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        wifi_ap_record_t ap{};
+        const int8_t rssi = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
         const auto *event = static_cast<ip_event_got_ip_t *>(event_data);
         char address[16]{};
         esp_ip4addr_ntoa(&event->ip_info.ip, address, sizeof(address));
         self->set_status(WifiMode::Station, true, NEEDLE_WIFI_SSID, address);
+        self->connected_since_ms_ = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+        portENTER_CRITICAL(&self->status_lock_);
+        self->status_.rssi = rssi;
+        const uint32_t reconnect_count = self->status_.reconnect_count;
+        portEXIT_CRITICAL(&self->status_lock_);
         xEventGroupSetBits(self->events_, STA_CONNECTED_BIT);
-        ESP_LOGI(TAG, "WiFi STA connected");
+        ESP_LOGI(TAG, "WiFi STA connected: rssi=%d reconnect=%lu", static_cast<int>(rssi), static_cast<unsigned long>(reconnect_count));
         ESP_LOGI(TAG, "SSID: %s", NEEDLE_WIFI_SSID);
         ESP_LOGI(TAG, "IP: %s", address);
     }

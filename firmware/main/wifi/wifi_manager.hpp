@@ -11,6 +11,9 @@ enum class WifiMode : uint8_t { Offline, Station, FallbackAp };
 struct WifiStatus {
     WifiMode mode = WifiMode::Offline;
     bool connected = false;
+    int8_t rssi = 0;
+    uint16_t last_disconnect_reason = 0;
+    uint32_t reconnect_count = 0;
     char ssid[33]{};
     char ip_address[16]{};
 };
@@ -33,6 +36,7 @@ private:
     esp_netif_t *station_netif_ = nullptr;
     esp_netif_t *ap_netif_ = nullptr;
     bool fallback_active_ = false;
+    uint32_t connected_since_ms_ = 0;
     mutable portMUX_TYPE status_lock_ = portMUX_INITIALIZER_UNLOCKED;
     WifiStatus status_{};
 };

@@ -2,6 +2,8 @@
 #include "esp_err.h"
 #include "esp_http_server.h"
 #include "freertos/FreeRTOS.h"
+
+#include <stddef.h>
 class MeasurementController;
 class WifiManager;
 class WebServer;
@@ -22,6 +24,7 @@ public:
     esp_err_t start(MeasurementController *controller, WifiManager *wifi);
     void record_logger_heartbeat(const char *client_name);
     LoggerSnapshot logger_snapshot() const;
+    size_t active_connections() const;
 
 private:
     httpd_handle_t server_ = nullptr;

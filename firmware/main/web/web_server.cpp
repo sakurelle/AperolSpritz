@@ -3,6 +3,9 @@
 #include "config/motion_config.hpp"
 #include "measurement/measurement_controller.hpp"
 #include "wifi/wifi_manager.hpp"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
+#include "freertos/task.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -16,6 +19,11 @@
 
 namespace {
 constexpr char TAG[] = "web";
+constexpr uint32_t DIAGNOSTIC_INTERVAL_MS = 15000;
+uint32_t status_request_count = 0;
+uint32_t status_failed_count = 0;
+uint32_t status_max_duration_us = 0;
+uint32_t last_diagnostic_ms = 0;
 
 const char PAGE[] = R"HTML(
 <!doctype html>
@@ -150,6 +158,7 @@ const char PAGE[] = R"HTML(
     </section>
   </main>
   <script>
+    let statusRequest=null;
     const phaseNames={IDLE:'Ожидание',MEASURE_FAST:'Быстрый проход',MEASURE_RETRACT:'Отъезд',MEASURE_FINE:'Точное измерение',MEASURE_FINAL_RETRACT:'Финальный отъезд',CALIBRATION_PREPARE:'Подготовка калибровки',AUTO_CALIBRATION_PREPARE:'Подготовка автокалибровки',CALIBRATE_FAST:'Калибровка: быстрый проход',CALIBRATE_RETRACT:'Калибровка: отъезд',CALIBRATE_FINE:'Калибровка: точное касание',CALIBRATE_FINAL_RETRACT:'Калибровка: финальный отъезд',AUTO_WAIT_SENSOR_CLEAR:'Ожидание освобождения датчика',AUTO_WAIT_NEEDLE:'Ожидание иглы',AUTO_WAIT_REMOVE:'Ожидание снятия иглы',AUTO_MOVE_TO_LOAD:'Возврат в загрузочную позицию',MANUAL_LEFT:'Ручное перемещение',SERVICE_MOVE:'Сервисное перемещение',FINISHED:'Операция завершена',STOPPED:'STOP',ERROR:'Ошибка'};
     const errorNames={NONE:'Нет',NEEDLE_NOT_FOUND:'Игла не обнаружена',CONTACT_ALREADY_ACTIVE:'CONTACT уже активен',CONTACT_RELEASE_TIMEOUT:'CONTACT не освободился вовремя',MEASUREMENT_TIMEOUT:'Тайм-аут измерения',CALIBRATION_TIMEOUT:'Тайм-аут калибровки',MAX_STEPS_REACHED:'Достигнут лимит шагов',NOT_CALIBRATED:'Нет калибровки',STOP_ACTIVE:'Активен STOP',INVALID_CONFIG:'Некорректные настройки',INTERNAL_ERROR:'Внутренняя ошибка'};
     let currentStatus=null;
@@ -230,7 +239,12 @@ const char PAGE[] = R"HTML(
       if(stopActive)showMessage('STOP активен. После устранения причины нажмите «Сброс STOP».',true);else if(error!=='NONE')showMessage(errorNames[error]||error,true);
     }
     async function request(path){const response=await fetch(`/api/${path}`,{method:'POST'});if(!response.ok)throw new Error(await response.text()||'Команда отклонена');showMessage('Команда принята');await refreshStatus();}
-    async function refreshStatus(){try{const response=await fetch('/api/status');if(!response.ok)throw new Error();put(await response.json());}catch(_){setText('connection','Нет связи с устройством');showMessage('Не удалось получить состояние устройства.',true);}}
+    async function runStatusRequest(){const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),3000);try{const response=await fetch('/api/status',{signal:controller.signal});if(!response.ok)throw new Error();put(await response.json());}catch(_){setText('connection','Нет связи с устройством');showMessage('Не удалось получить состояние устройства.',true);}finally{clearTimeout(timeout);}}
+    async function refreshStatus(){
+      if(!statusRequest)statusRequest=runStatusRequest().finally(()=>{statusRequest=null;});
+      return statusRequest;
+    }
+    async function pollStatus(){await refreshStatus();setTimeout(pollStatus,1200);}
     async function loadConfig(){try{const response=await fetch('/api/config');if(!response.ok)throw new Error();const config=await response.json();for(const key of ['nominal_length_mm','tolerance_mm','calibration_length_mm','auto_calibration_length_mm','retract_mm','auto_calibration_interval'])byId(key).value=config[key];byId('measure_dir_inverted').checked=Boolean(config.measure_dir_inverted);}catch(_){showMessage('Не удалось загрузить настройки.',true);}}
     async function saveConfig(event){event.preventDefault();const config={};for(const key of ['nominal_length_mm','tolerance_mm','calibration_length_mm','auto_calibration_length_mm','retract_mm','auto_calibration_interval'])config[key]=Number(byId(key).value);config.measure_dir_inverted=byId('measure_dir_inverted').checked;try{const response=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)});if(!response.ok)throw new Error(await response.text()||'Настройки отклонены');showMessage('Настройки сохранены');await refreshStatus();}catch(error){showMessage(error.message||'Не удалось сохранить настройки.',true);}}
     async function serviceMove(event){
@@ -263,7 +277,7 @@ const char PAGE[] = R"HTML(
     byId('service-move-form').addEventListener('submit',serviceMove);
     byId('service-calculate').addEventListener('click',calculateServiceCoefficient);
     byId('service-apply').addEventListener('click',applyServiceCoefficient);
-    loadConfig();refreshStatus();setInterval(refreshStatus,700);
+    loadConfig();pollStatus();
   </script>
 </body>
 </html>
@@ -295,19 +309,52 @@ bool snapshot(httpd_req_t *request, StatusSnapshot &measurement, WifiStatus &wif
     auto *web = context(request);
     return web && web->controller && web->wifi && web->controller->snapshot(measurement) && ((wifi = web->wifi->snapshot()), true);
 }
+void record_status_result(httpd_req_t *request, int64_t started_us, bool successful, const WifiStatus &wifi) {
+    ++status_request_count;
+    if (!successful) ++status_failed_count;
+    const uint32_t duration_us = static_cast<uint32_t>(esp_timer_get_time() - started_us);
+    if (duration_us > status_max_duration_us) status_max_duration_us = duration_us;
+    const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    if (successful && now_ms - last_diagnostic_ms < DIAGNOSTIC_INTERVAL_MS) return;
+    last_diagnostic_ms = now_ms;
+    auto *web = context(request);
+    const size_t connections = web && web->server ? web->server->active_connections() : 0;
+    ESP_LOGI(TAG,
+             "HTTP diag: requests=%lu failed=%lu duration_us=%lu max_duration_us=%lu "
+             "stack_free_bytes=%lu sockets=%u heap_free=%lu heap_min=%lu heap_largest=%lu "
+             "wifi_rssi=%d wifi_reconnect=%lu last_disconnect=%u reset_reason=%d",
+             static_cast<unsigned long>(status_request_count), static_cast<unsigned long>(status_failed_count),
+             static_cast<unsigned long>(duration_us), static_cast<unsigned long>(status_max_duration_us),
+             static_cast<unsigned long>(uxTaskGetStackHighWaterMark(nullptr)), static_cast<unsigned>(connections),
+             static_cast<unsigned long>(esp_get_free_heap_size()), static_cast<unsigned long>(esp_get_minimum_free_heap_size()),
+             static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)), static_cast<int>(wifi.rssi),
+             static_cast<unsigned long>(wifi.reconnect_count), static_cast<unsigned>(wifi.last_disconnect_reason),
+             static_cast<int>(esp_reset_reason()));
+}
+
 
 esp_err_t status(httpd_req_t *request) {
+    const int64_t started_us = esp_timer_get_time();
     StatusSnapshot measurement{};
     WifiStatus wifi{};
-    if (!snapshot(request, measurement, wifi)) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Controller unavailable");
+    if (!snapshot(request, measurement, wifi)) {
+        auto *web = context(request);
+        if (web && web->wifi) wifi = web->wifi->snapshot();
+        const esp_err_t result = httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Controller unavailable");
+        record_status_result(request, started_us, false, wifi);
+        return result;
+    }
     auto *web = context(request);
     const LoggerSnapshot logger = web && web->server ? web->server->logger_snapshot() : LoggerSnapshot{};
     const uint32_t remaining = measurement.stats.auto_measurements_since_calibration >= measurement.config.auto_calibration_interval ? 0 : measurement.config.auto_calibration_interval - measurement.stats.auto_measurements_since_calibration;
-    char body[2600];
+    static char body[2600];
     const int length = std::snprintf(body, sizeof(body),
         "{\"state\":\"%s\",\"error\":\"%s\",\"needle_present\":%s,\"contact\":%s,\"stop_active\":%s,\"motor_enabled\":%s,\"auto_mode_enabled\":%s,\"auto_stop_requested\":%s,\"auto_phase\":\"%s\",\"current_speed_steps_s\":%lu,\"position_steps\":%lld,\"last_length_mm\":%.6f,\"nominal_length_mm\":%.6f,\"deviation_mm\":%.6f,\"tolerance_mm\":%.6f,\"result\":\"%s\",\"calibration_valid\":%s,\"calibration_source\":\"%s\",\"calibration_reference_length_mm\":%.6f,\"measurements_since_calibration\":%lu,\"auto_calibration_interval\":%lu,\"auto_measurements_since_calibration\":%lu,\"auto_calibration_remaining\":%lu,\"mm_per_step\":%.9f,\"service_move_requested_mm\":%.6f,\"service_move_target_steps\":%lu,\"device_id\":\"%s\",\"boot_id\":\"%016llx\",\"latest_measurement_seq\":%lu,\"logger_connected\":%s,\"logger_client_name\":\"%s\",\"wifi_mode\":\"%s\",\"wifi_connected\":%s,\"ip_address\":\"%s\"}",
         state_name(measurement.state), error_name(measurement.error), measurement.needle_present ? "true" : "false", measurement.contact ? "true" : "false", measurement.stop_active ? "true" : "false", measurement.motor_enabled ? "true" : "false", measurement.auto_mode_enabled ? "true" : "false", measurement.auto_stop_requested ? "true" : "false", measurement.auto_phase, static_cast<unsigned long>(measurement.current_speed_steps_s), static_cast<long long>(measurement.position_steps), measurement.stats.last_measured_length, measurement.config.nominal_length_mm, measurement.stats.last_deviation, measurement.config.tolerance_mm, measurement.stats.last_result, measurement.stats.calibration_valid ? "true" : "false", calibration_source_name(measurement.stats.calibration_source), measurement.stats.calibration_reference_length_mm, static_cast<unsigned long>(measurement.stats.measurements_since_calibration), static_cast<unsigned long>(measurement.config.auto_calibration_interval), static_cast<unsigned long>(measurement.stats.auto_measurements_since_calibration), static_cast<unsigned long>(remaining), measurement.config.mm_per_step, measurement.service_move_requested_mm, static_cast<unsigned long>(measurement.service_move_target_steps), measurement.device_id, static_cast<unsigned long long>(measurement.boot_id), static_cast<unsigned long>(measurement.latest_measurement_seq), logger.connected ? "true" : "false", logger.client_name, wifi_mode_name(wifi.mode), wifi.connected ? "true" : "false", wifi.ip_address);
-    return length < 0 || static_cast<size_t>(length) >= sizeof(body) ? ESP_ERR_NO_MEM : json(request, body);
+    const bool formatted = length >= 0 && static_cast<size_t>(length) < sizeof(body);
+    const esp_err_t result = formatted ? json(request, body) : ESP_ERR_NO_MEM;
+    record_status_result(request, started_us, formatted && result == ESP_OK, wifi);
+    return result;
 }
 
 esp_err_t get_config(httpd_req_t *request) {
@@ -520,6 +567,13 @@ LoggerSnapshot WebServer::logger_snapshot() const {
     if (!result.connected) result.client_name[0] = 0;
     return result;
 }
+size_t WebServer::active_connections() const {
+    if (!server_) return 0;
+    int client_fds[8]{};
+    size_t count = sizeof(client_fds) / sizeof(client_fds[0]);
+    return httpd_get_client_list(server_, &count, client_fds) == ESP_OK ? count : 0;
+}
+
 
 esp_err_t WebServer::start(MeasurementController *controller, WifiManager *wifi) {
     if (!controller || !wifi) return ESP_ERR_INVALID_ARG;
@@ -527,6 +581,9 @@ esp_err_t WebServer::start(MeasurementController *controller, WifiManager *wifi)
     context_ = {controller, wifi, this};
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 20;
+    config.lru_purge_enable = true;
+    config.recv_wait_timeout = 3;
+    config.send_wait_timeout = 3;
     httpd_handle_t server = nullptr;
     esp_err_t error = httpd_start(&server, &config);
     if (error != ESP_OK) return error;

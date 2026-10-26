@@ -1,6 +1,8 @@
 import csv
+import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -8,7 +10,7 @@ from openpyxl import load_workbook
 from aperolspritz.database import MeasurementDatabase
 from aperolspritz.exporter import export_csv, export_excel
 from aperolspritz.models import Device, MeasurementEvent, result_status
-from aperolspritz.settings import SettingsStore
+from aperolspritz.settings import SettingsStore, application_data_dir
 
 
 def sample_event(sequence: int = 1) -> MeasurementEvent:
@@ -41,6 +43,11 @@ class ResultTests(unittest.TestCase):
 
 
 class SettingsTests(unittest.TestCase):
+    def test_application_data_dir_uses_appdata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.dict(os.environ, {"APPDATA": temporary}):
+                self.assertEqual(Path(temporary) / "AperolSpritz", application_data_dir())
+
     def test_save_and_load(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "settings.json"

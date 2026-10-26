@@ -17,7 +17,11 @@ firmware/secrets.txt
 !.vscode/extensions.json
 .vscode/settings.json
 desktop/.venv/
+desktop/.python312/
 desktop/venv/
+desktop/build/
+desktop/dist/
+desktop/release/
 desktop/__pycache__/
 desktop/**/*.pyc
 desktop/data/

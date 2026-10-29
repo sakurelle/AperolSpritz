@@ -38,7 +38,9 @@ class DatabaseTests(unittest.TestCase):
 class ResultTests(unittest.TestCase):
     def test_result_status(self) -> None:
         self.assertEqual("OK", result_status(0.079, 0.1))
-        self.assertEqual("NEAR_LIMIT", result_status(0.08, 0.1))
+        # Match the Web UI's direct IEEE-754 comparison without pre-rounding.
+        self.assertEqual("OK", result_status(0.08, 0.1))
+        self.assertEqual("NEAR_LIMIT", result_status(0.080001, 0.1))
         self.assertEqual("OUT_OF_TOLERANCE", result_status(-0.101, 0.1))
 
 

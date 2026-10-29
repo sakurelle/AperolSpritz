@@ -66,6 +66,6 @@ def result_status(deviation_mm: float, tolerance_mm: float) -> str:
     deviation = abs(float(deviation_mm))
     if deviation > tolerance:
         return "OUT_OF_TOLERANCE"
-    if tolerance > 0.0 and deviation + 1e-12 >= tolerance * 0.8:
+    if tolerance > 0.0 and deviation >= tolerance * 0.8:
         return "NEAR_LIMIT"
     return "OK"
